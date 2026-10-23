@@ -5,6 +5,8 @@ on:
     - cron: '*/5 6-16 * * 1-5'
     - cron: '*/15 0-5,17-23 * * 1-5'
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   run-bot:
@@ -31,5 +33,3 @@ jobs:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: python app.py
-
-      
