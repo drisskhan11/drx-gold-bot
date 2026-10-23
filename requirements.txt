@@ -1,11 +1,7 @@
-python-telegram-bot[job-queue]>=22.0
-fastapi
-uvicorn
-google-genai
-smart-money-concept
+python-telegram-bot
 yfinance
 pandas
 numpy
 requests
-tzdata
-pydantic
+google-genai
+scikit-learn
