@@ -18,13 +18,13 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==========================================
-# ⚙️ الإعدادات (تقرأ من GitHub Secrets)
+# ⚙️ الإعدادات
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-DB_FILE = "quantum_beast_25.db"
+DB_FILE = "quantum_beast_26.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
 
@@ -173,13 +173,32 @@ def is_news_dangerous():
     except Exception:
         return False, None
 
-async def ask_ai(data_summary):
+# ==========================================
+# 🧠 مجلس العباقرة (Multi-Agent AI)
+# ==========================================
+async def ask_ai_council(data_summary):
     if not ai_enabled: return "⚠️ AI غير متاح."
     try:
-        prompt = f"أنت خبير تداول في الذهب. المعطيات:\n{data_summary}\n\nأعطني قرارك في 3 أسطر بالدارجة: 1. القرار 2. السبب 3. إدارة المخاطر"
+        prompt = f"""
+        أنت مجلس خبراء تداول (Multi-Agent System) مكون من 3 أعضاء.
+        المعطيات الحالية للسوق:
+        {data_summary}
+
+        المطلوب منك أن تلعب الأدوار الثلاثة بالدارجة المغربية:
+        1. 🧠 [المحلل الفني]: قدم حجة قوية بناءً على المعطيات (SMC, PCA, توقع الشبكة).
+        2. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (فخ سيولة، تضارب ماكرو، إشارة كاذبة).
+        3. ⚖️ [مدير المخاطر]: استمع للرأيين، وأعطي القرار النهائي (شراء / بيع / انتظار).
+
+        إذا كان محامي الشيطان عنده حجة قوية، يجب على مدير المخاطر أن يختار "انتظار" لحماية رأس المال.
+
+        الرد يجب أن يكون بهذا الشكل بالضبط:
+        🧠 المحلل: [جملة واحدة]
+        😈 محامي الشيطان: [جملة واحدة]
+        ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة واحدة]
+        """
         response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
         return response.text
-    except Exception:
+    except Exception as e:
         return "⚠️ AI مشغول، تم الاعتماد على التحليل الفني."
 
 async def run_engine(use_ai=True):
@@ -212,7 +231,7 @@ async def run_engine(use_ai=True):
             signal_dir = -1; ob_zone = m15_ob
 
         if signal_dir == 0:
-            return None, None # كيموت بلا ما يصيفط باش ما يزعجكش
+            return None, None
 
         if signal_dir == 1 and macro_bias == "BEARISH_GOLD": return None, None
         if signal_dir == -1 and macro_bias == "BULLISH_GOLD": return None, None
@@ -239,8 +258,13 @@ async def run_engine(use_ai=True):
 
         ai_verdict = "⚠️ AI غير مستعمل."
         if use_ai:
-            ai_summary = f"- السعر: {current_price}\n- H4: {h4_msg}\n- H1: {h1_msg}\n- M15: {m15_msg}\n- الماكرو: {macro_msg}\n- الارتباط: {corr}\n- توقع الشبكة: {predicted}\n- PCA: {pca_score}%\n- السيولة: فوق {hidden_above} | تحت {hidden_below}\n- الإشارة: {trade_type}"
-            ai_verdict = await ask_ai(ai_summary)
+            ai_summary = f"- السعر: {current_price}\n- H4: {h4_msg}\n- H1: {h1_msg}\n- M15: {m15_msg}\n- الماكرو: {macro_msg}\n- الارتباط: {corr}\n- توقع الشبكة: {predicted}\n- PCA: {pca_score}%\n- السيولة: فوق {hidden_above} | تحت {hidden_below}\n- نوع الإشارة الفنية: {trade_type}"
+            ai_verdict = await ask_ai_council(ai_summary)
+            
+            # إلا كان مدير المخاطر قال "انتظار"، كنلغيو الإشارة باش نحميو الفلوس
+            if "انتظار" in ai_verdict:
+                logging.info("Council Vetoed the trade.")
+                return None, None
 
         payload = {
             "time": str(df_m15.index[-1]), "type": trade_type,
@@ -256,8 +280,11 @@ async def run_engine(use_ai=True):
         return None, f"❌ خطأ: {e}"
 
 def format_card(sig):
+    now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
     return (
-        f"👑 *الوحش 25.0*\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"👑 *الوحش 26.0 (مجلس العباقرة)*\n"
+        f"🕐 *الوقت:* `{now_ma}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{sig['type']}\n\n"
         f"🎯 *الدخول:* `{sig['entry']:.2f}`\n"
         f"🛑 *الوقف:* `{sig['sl']:.2f}`\n"
@@ -269,7 +296,7 @@ def format_card(sig):
         f"{sig['heat']}\n"
         f"{sig['dark']}\n"
         f"💵 *الماكرو:* {sig['macro']}\n\n"
-        f"🧠 *AI:*\n{sig['ai']}\n"
+        f"🧠 *مجلس العباقرة:*\n{sig['ai']}\n"
     )
 
 async def main():
