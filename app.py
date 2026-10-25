@@ -24,7 +24,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-DB_FILE = "quantum_beast_26.db"
+DB_FILE = "quantum_beast_27.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
 
@@ -37,6 +37,9 @@ except Exception as e:
     logging.error(f"AI Error: {e}")
     ai_enabled = False
 
+# ==========================================
+# 🗄️ قاعدة البيانات
+# ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.executescript("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);")
@@ -59,6 +62,9 @@ def is_in_killzone():
     t = now.hour + now.minute / 60
     return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
+# ==========================================
+# 🌐 جلب البيانات
+# ==========================================
 async def fetch_data(symbol, period, interval):
     try:
         ticker = yf.Ticker(symbol)
@@ -67,6 +73,42 @@ async def fetch_data(symbol, period, interval):
     except Exception:
         return None
 
+# ==========================================
+# 🧠 العلوم المخفية الجديدة
+# ==========================================
+def calculate_hurst_exponent(price_series, max_lag=20):
+    try:
+        if len(price_series) < max_lag: return 0.5
+        lags = range(2, max_lag)
+        tau = [np.sqrt(np.std(np.subtract(price_series[lag:], price_series[:-lag]))) for lag in lags]
+        poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
+        return round(poly[0] * 2.0, 2)
+    except Exception:
+        return 0.5
+
+def calculate_adr(df_d1):
+    try:
+        if df_d1 is None or len(df_d1) < 14: return 0
+        df_d1['Range'] = df_d1['High'] - df_d1['Low']
+        return round(df_d1['Range'].rolling(14).mean().iloc[-1], 2)
+    except Exception:
+        return 0
+
+def get_golden_pocket(df):
+    try:
+        if df is None or len(df) < 20: return None, None
+        recent_high = df['High'].tail(20).max()
+        recent_low = df['Low'].tail(20).min()
+        diff = recent_high - recent_low
+        fib_618 = recent_high - (diff * 0.618)
+        fib_65 = recent_high - (diff * 0.65)
+        return round(min(fib_618, fib_65), 2), round(max(fib_618, fib_65), 2)
+    except Exception:
+        return None, None
+
+# ==========================================
+# 🧠 SMC و المؤشرات القديمة
+# ==========================================
 def analyze_smc(df, label):
     if df is None or len(df) < 50: return 0, None, f"{label}: بيانات غير كافية"
     try:
@@ -185,7 +227,7 @@ async def ask_ai_council(data_summary):
         {data_summary}
 
         المطلوب منك أن تلعب الأدوار الثلاثة بالدارجة المغربية:
-        1. 🧠 [المحلل الفني]: قدم حجة قوية بناءً على المعطيات (SMC, PCA, توقع الشبكة).
+        1. 🧠 [المحلل الفني]: قدم حجة قوية بناءً على المعطيات (SMC, PCA, Hurst, Fib, OI).
         2. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (فخ سيولة، تضارب ماكرو، إشارة كاذبة).
         3. ⚖️ [مدير المخاطر]: استمع للرأيين، وأعطي القرار النهائي (شراء / بيع / انتظار).
 
@@ -201,17 +243,21 @@ async def ask_ai_council(data_summary):
     except Exception as e:
         return "⚠️ AI مشغول، تم الاعتماد على التحليل الفني."
 
+# ==========================================
+# 🚀 المحرك الرئيسي
+# ==========================================
 async def run_engine(use_ai=True):
     danger, msg = is_news_dangerous()
     if danger: return None, f"⚠️ درع الأخبار: {msg}"
     try:
         macro_bias, macro_msg = await get_macro_bias()
+        df_d1 = await fetch_data("GC=F", "1y", "1d"); await asyncio.sleep(1)
         df_h4 = await fetch_data("GC=F", "3mo", "4h"); await asyncio.sleep(1)
         df_h1 = await fetch_data("GC=F", "1mo", "1h"); await asyncio.sleep(1)
         df_m15 = await fetch_data("GC=F", "5d", "15m")
         dxy_data = await fetch_data("DX-Y.NYB", "1mo", "1h")
 
-        if any(d is None for d in [df_h4, df_h1, df_m15]):
+        if any(d is None for d in [df_d1, df_h4, df_h1, df_m15]):
             return None, "❌ تعذر جلب بيانات."
 
         h4_dir, h4_ob, h4_msg = analyze_smc(df_h4, "H4")
@@ -223,6 +269,19 @@ async def run_engine(use_ai=True):
         poc, hot_zones = calculate_heatmap(df_h1)
         pca_score = pca_analysis(df_h1)
         hidden_above, hidden_below = market_maker_simulation(df_h1)
+        
+        # العلوم المخفية
+        hurst = calculate_hurst_exponent(df_h1['Close'].values)
+        adr = calculate_adr(df_d1)
+        fib_low, fib_high = get_golden_pocket(df_h1)
+        
+        # Open Interest (إلا كان متوفر)
+        oi_msg = "غير متاح"
+        try:
+            if 'Open Interest' in df_h1.columns and df_h1['Open Interest'].iloc[-1] > 0:
+                oi_msg = f"{int(df_h1['Open Interest'].iloc[-1])}"
+        except Exception:
+            pass
 
         signal_dir = 0; ob_zone = None
         if h4_dir == 1 and h1_dir == 1 and m15_dir == 1:
@@ -258,10 +317,18 @@ async def run_engine(use_ai=True):
 
         ai_verdict = "⚠️ AI غير مستعمل."
         if use_ai:
-            ai_summary = f"- السعر: {current_price}\n- H4: {h4_msg}\n- H1: {h1_msg}\n- M15: {m15_msg}\n- الماكرو: {macro_msg}\n- الارتباط: {corr}\n- توقع الشبكة: {predicted}\n- PCA: {pca_score}%\n- السيولة: فوق {hidden_above} | تحت {hidden_below}\n- نوع الإشارة الفنية: {trade_type}"
+            ai_summary = f"""
+            - السعر: {current_price} | ADR: {adr}
+            - H4: {h4_msg} | H1: {h1_msg} | M15: {m15_msg}
+            - الماكرو: {macro_msg} | الارتباط: {corr} | Open Interest: {oi_msg}
+            - Hurst: {hurst} (فوق 0.5 ترند، تحت 0.5 تذبذب)
+            - Fib Golden Pocket: {fib_low} - {fib_high}
+            - توقع الشبكة: {predicted} | PCA: {pca_score}%
+            - السيولة: فوق {hidden_above} | تحت {hidden_below}
+            - نوع الإشارة الفنية: {trade_type}
+            """
             ai_verdict = await ask_ai_council(ai_summary)
             
-            # إلا كان مدير المخاطر قال "انتظار"، كنلغيو الإشارة باش نحميو الفلوس
             if "انتظار" in ai_verdict:
                 logging.info("Council Vetoed the trade.")
                 return None, None
@@ -273,17 +340,23 @@ async def run_engine(use_ai=True):
             "corr": f"🔗 الارتباط: {corr}", "nn": f"🧬 توقع الشبكة: {predicted}",
             "heat": f"🔥 POC: {poc}", 
             "dark": f"🔮 PCA: {pca_score}% | ⚫ سيولة: فوق {hidden_above} | تحت {hidden_below}",
+            "hidden_science": f"🔬 Hurst: {hurst} | 📏 ADR: {adr} | 🧬 OI: {oi_msg}\n🎯 Fib Pocket: {fib_low} - {fib_high}",
             "ai": ai_verdict
         }
         return payload, None
     except Exception as e:
         return None, f"❌ خطأ: {e}"
 
+# ==========================================
+# 📱 واجهة تليجرام
+# ==========================================
 def format_card(sig):
+    # نجيبو الوقت الحالي بتوقيت المغرب
     now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
+    
     return (
-        f"👑 *الوحش 26.0 (مجلس العباقرة)*\n"
-        f"🕐 *الوقت:* `{now_ma}`\n"
+        f"👑 *الوحش 27.0 (العلوم المخفية)*\n"
+        f"🕐 *وقت التحليل:* `{now_ma}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{sig['type']}\n\n"
         f"🎯 *الدخول:* `{sig['entry']:.2f}`\n"
@@ -295,6 +368,7 @@ def format_card(sig):
         f"{sig['nn']}\n"
         f"{sig['heat']}\n"
         f"{sig['dark']}\n"
+        f"{sig['hidden_science']}\n"
         f"💵 *الماكرو:* {sig['macro']}\n\n"
         f"🧠 *مجلس العباقرة:*\n{sig['ai']}\n"
     )
