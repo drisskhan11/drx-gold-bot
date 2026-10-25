@@ -5,3 +5,4 @@ numpy
 requests
 google-genai
 scikit-learn
+openai
