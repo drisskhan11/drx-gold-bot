@@ -13,6 +13,7 @@ import requests
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
 import telegram
+from openai import OpenAI
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,9 +23,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-DB_FILE = "quantum_beast_27.db"
+DB_FILE = "quantum_beast_28.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
 
@@ -74,7 +77,7 @@ async def fetch_data(symbol, period, interval):
         return None
 
 # ==========================================
-# 🧠 العلوم المخفية الجديدة
+# 🧠 العلوم المخفية
 # ==========================================
 def calculate_hurst_exponent(price_series, max_lag=20):
     try:
@@ -107,7 +110,7 @@ def get_golden_pocket(df):
         return None, None
 
 # ==========================================
-# 🧠 SMC و المؤشرات القديمة
+# 🧠 SMC و المؤشرات
 # ==========================================
 def analyze_smc(df, label):
     if df is None or len(df) < 50: return 0, None, f"{label}: بيانات غير كافية"
@@ -216,32 +219,60 @@ def is_news_dangerous():
         return False, None
 
 # ==========================================
-# 🧠 مجلس العباقرة (Multi-Agent AI)
+# 🧠 مجلس العباقرة (Multi-Provider AI)
 # ==========================================
 async def ask_ai_council(data_summary):
-    if not ai_enabled: return "⚠️ AI غير متاح."
-    try:
-        prompt = f"""
-        أنت مجلس خبراء تداول (Multi-Agent System) مكون من 3 أعضاء.
-        المعطيات الحالية للسوق:
-        {data_summary}
+    prompt = f"""
+    أنت مجلس خبراء تداول (Multi-Agent System) مكون من 3 أعضاء.
+    المعطيات الحالية للسوق:
+    {data_summary}
 
-        المطلوب منك أن تلعب الأدوار الثلاثة بالدارجة المغربية:
-        1. 🧠 [المحلل الفني]: قدم حجة قوية بناءً على المعطيات (SMC, PCA, Hurst, Fib, OI).
-        2. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (فخ سيولة، تضارب ماكرو، إشارة كاذبة).
-        3. ⚖️ [مدير المخاطر]: استمع للرأيين، وأعطي القرار النهائي (شراء / بيع / انتظار).
+    المطلوب منك أن تلعب الأدوار الثلاثة بالدارجة المغربية:
+    1. 🧠 [المحلل الفني]: قدم حجة قوية بناءً على المعطيات (SMC, PCA, Hurst, Fib, OI).
+    2. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (فخ سيولة، تضارب ماكرو، إشارة كاذبة).
+    3. ⚖️ [مدير المخاطر]: استمع للرأيين، وأعطي القرار النهائي (شراء / بيع / انتظار).
 
-        إذا كان محامي الشيطان عنده حجة قوية، يجب على مدير المخاطر أن يختار "انتظار" لحماية رأس المال.
+    إذا كان محامي الشيطان عنده حجة قوية، يجب على مدير المخاطر أن يختار "انتظار" لحماية رأس المال.
 
-        الرد يجب أن يكون بهذا الشكل بالضبط:
-        🧠 المحلل: [جملة واحدة]
-        😈 محامي الشيطان: [جملة واحدة]
-        ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة واحدة]
-        """
-        response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
-        return response.text
-    except Exception as e:
-        return "⚠️ AI مشغول، تم الاعتماد على التحليل الفني."
+    الرد يجب أن يكون بهذا الشكل بالضبط:
+    🧠 المحلل: [جملة واحدة]
+    😈 محامي الشيطان: [جملة واحدة]
+    ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة واحدة]
+    """
+    
+    # 1. المحاولة الأولى: Gemini
+    if ai_enabled:
+        try:
+            response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
+            return response.text
+        except Exception as e:
+            logging.warning(f"Gemini failed: {e}. Falling back to Groq.")
+
+    # 2. المحاولة الثانية: Groq
+    if GROQ_API_KEY:
+        try:
+            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.warning(f"Groq failed: {e}. Falling back to OpenRouter.")
+
+    # 3. المحاولة الثالثة: OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+            response = client.chat.completions.create(
+                model="meta-llama/llama-3.3-70b-instruct:free",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"All AI providers failed: {e}")
+
+    return "⚠️ جميع مزودي الذكاء الاصطناعي مشغولين دابا، تم الاعتماد على التحليل الفني."
 
 # ==========================================
 # 🚀 المحرك الرئيسي
@@ -270,12 +301,10 @@ async def run_engine(use_ai=True):
         pca_score = pca_analysis(df_h1)
         hidden_above, hidden_below = market_maker_simulation(df_h1)
         
-        # العلوم المخفية
         hurst = calculate_hurst_exponent(df_h1['Close'].values)
         adr = calculate_adr(df_d1)
         fib_low, fib_high = get_golden_pocket(df_h1)
         
-        # Open Interest (إلا كان متوفر)
         oi_msg = "غير متاح"
         try:
             if 'Open Interest' in df_h1.columns and df_h1['Open Interest'].iloc[-1] > 0:
@@ -351,11 +380,9 @@ async def run_engine(use_ai=True):
 # 📱 واجهة تليجرام
 # ==========================================
 def format_card(sig):
-    # نجيبو الوقت الحالي بتوقيت المغرب
     now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
-    
     return (
-        f"👑 *الوحش 27.0 (العلوم المخفية)*\n"
+        f"👑 *الوحش 28.0 (Multi-AI)*\n"
         f"🕐 *وقت التحليل:* `{now_ma}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{sig['type']}\n\n"
