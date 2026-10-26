@@ -1,0 +1,26 @@
+name: Run Backtest
+
+on:
+  workflow_dispatch: # كيتشغل غير بيدك
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run Backtest
+      run: python backtest.py
