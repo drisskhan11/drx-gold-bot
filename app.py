@@ -76,15 +76,36 @@ def is_in_killzone():
     return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
-# 🌐 جلب البيانات
+# 🌐 جلب البيانات (مع Fallback)
 # ==========================================
 async def fetch_data(symbol, period, interval):
+    # المحاولة الأولى: الرمز الأساسي (GC=F)
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval)
-        return df if not df.empty else None
-    except Exception:
-        return None
+        if not df.empty: return df
+    except Exception as e:
+        logging.warning(f"Primary symbol {symbol} failed: {e}")
+
+    # المحاولة الثانية: الرمز الاحتياطي (XAUUSD=X)
+    try:
+        fallback_symbol = "XAUUSD=X" if symbol == "GC=F" else symbol
+        ticker = yf.Ticker(fallback_symbol)
+        df = ticker.history(period=period, interval=interval)
+        if not df.empty: return df
+    except Exception as e:
+        logging.warning(f"Fallback symbol {fallback_symbol} failed: {e}")
+
+    # المحاولة الثالثة: GLD (ETF الذهب)
+    if symbol == "GC=F":
+        try:
+            ticker = yf.Ticker("GLD")
+            df = ticker.history(period=period, interval=interval)
+            if not df.empty: return df
+        except Exception as e:
+            logging.warning(f"GLD failed: {e}")
+
+    return None
 
 # ==========================================
 # 🧠 العلوم المخفية
@@ -224,9 +245,9 @@ def is_news_dangerous():
             title = news.get('title', '')
             if news_time.date() == now_ny.date() and any(k in title for k in critical):
                 return True, f"حدث مفصلي: {title}"
-        return False, None
+        return False, "آمن"
     except Exception:
-        return False, None
+        return False, "تعذر جلب الأخبار"
 
 # ==========================================
 # 🧠 مجلس العباقرة (Multi-Provider AI)
@@ -238,65 +259,45 @@ async def ask_ai_council(data_summary):
     {data_summary}
 
     المطلوب منك أن تلعب الأدوار الثلاثة بالدارجة المغربية:
-    1. 🧠 [المحلل الفني]: قدم حجة قوية بناءً على المعطيات (SMC, PCA, Hurst, Fib, OI).
-    2. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (فخ سيولة، تضارب ماكرو، إشارة كاذبة).
-    3. ⚖️ [مدير المخاطر]: استمع للرأيين، وأعطي القرار النهائي (شراء / بيع / انتظار).
-
-    إذا كان محامي الشيطان عنده حجة قوية، يجب على مدير المخاطر أن يختار "انتظار" لحماية رأس المال.
-
-    الرد يجب أن يكون بهذا الشكل بالضبط:
+    1. 🧠 [المحلل الفني]: قدم حجة بناءً على المعطيات.
+    2. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل.
+    3. ⚖️ [مدير المخاطر]: أعطي القرار النهائي (شراء / بيع / انتظار).
+    الرد يجب أن يكون بهذا الشكل:
     🧠 المحلل: [جملة واحدة]
     😈 محامي الشيطان: [جملة واحدة]
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة واحدة]
     """
-    
-    # 1. Gemini
     if ai_enabled:
         try:
             response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
             return response.text
-        except Exception as e:
-            logging.warning(f"Gemini failed: {e}. Falling back to Groq.")
-
-    # 2. Groq
+        except: pass
     if GROQ_API_KEY:
         try:
             client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}]
-            )
+            response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
             return response.choices[0].message.content
-        except Exception as e:
-            logging.warning(f"Groq failed: {e}. Falling back to OpenRouter.")
-
-    # 3. OpenRouter
+        except: pass
     if OPENROUTER_API_KEY:
         try:
             client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-            response = client.chat.completions.create(
-                model="meta-llama/llama-3.3-70b-instruct:free",
-                messages=[{"role": "user", "content": prompt}]
-            )
+            response = client.chat.completions.create(model="meta-llama/llama-3.3-70b-instruct:free", messages=[{"role": "user", "content": prompt}])
             return response.choices[0].message.content
-        except Exception as e:
-            logging.error(f"All AI providers failed: {e}")
-
-    return "⚠️ جميع مزودي الذكاء الاصطناعي مشغولين دابا، تم الاعتماد على التحليل الفني."
+        except: pass
+    return "⚠️ AI غير متاح دابا."
 
 # ==========================================
 # 🚀 المحرك الرئيسي
 # ==========================================
-async def run_engine(use_ai=True):
-    danger, msg = is_news_dangerous()
-    if danger: return None, f"⚠️ درع الأخبار: {msg}"
+async def run_engine():
     try:
         macro_bias, macro_msg = await get_macro_bias()
+        news_danger, news_msg = is_news_dangerous()
+        
         df_d1 = await fetch_data("GC=F", "1y", "1d"); await asyncio.sleep(1)
         df_h4 = await fetch_data("GC=F", "3mo", "4h"); await asyncio.sleep(1)
         df_h1 = await fetch_data("GC=F", "1mo", "1h"); await asyncio.sleep(1)
         df_m15 = await fetch_data("GC=F", "5d", "15m")
-        dxy_data = await fetch_data("DX-Y.NYB", "1mo", "1h")
 
         if any(d is None for d in [df_d1, df_h4, df_h1, df_m15]):
             return None, "❌ تعذر جلب بيانات."
@@ -305,157 +306,101 @@ async def run_engine(use_ai=True):
         h1_dir, h1_ob, h1_msg = analyze_smc(df_h1, "H1")
         m15_dir, m15_ob, m15_msg = analyze_smc(df_m15, "M15")
         
-        corr = calculate_correlation(df_h1, dxy_data)
-        predicted = ai_predict_price(df_h1)
-        poc, hot_zones = calculate_heatmap(df_h1)
-        pca_score = pca_analysis(df_h1)
-        hidden_above, hidden_below = market_maker_simulation(df_h1)
-        
         hurst = calculate_hurst_exponent(df_h1['Close'].values)
         adr = calculate_adr(df_d1)
-        fib_low, fib_high = get_golden_pocket(df_h1)
-        
-        oi_msg = "غير متاح"
-        try:
-            if 'Open Interest' in df_h1.columns and df_h1['Open Interest'].iloc[-1] > 0:
-                oi_msg = f"{int(df_h1['Open Interest'].iloc[-1])}"
-        except Exception:
-            pass
+        poc, hot_zones = calculate_heatmap(df_h1)
+        hidden_above, hidden_below = market_maker_simulation(df_h1)
+        current_price = df_m15['Close'].iloc[-1]
 
-        signal_dir = 0; ob_zone = None
+        if news_danger:
+            report = f"🚨 *تحذير أخبار:* {news_msg}\n⚠️ كنسناو الخبر يفوت باش ندخلو."
+            return {"type": "NEWS", "msg": report}, None
+
+        smc_status = f"H4: {h4_msg}\nH1: {h1_msg}\nM15: {m15_msg}"
+        
+        signal_dir = 0
         if h4_dir == 1 and h1_dir == 1 and m15_dir == 1:
-            signal_dir = 1; ob_zone = m15_ob
+            signal_dir = 1
         elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1:
-            signal_dir = -1; ob_zone = m15_ob
+            signal_dir = -1
 
         if signal_dir == 0:
-            return None, None
+            report = (
+                f"👀 *تقرير استخبارات السوق*\n"
+                f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 السعر: `{current_price:.2f}`\n"
+                f"💵 الدولار: {macro_msg}\n"
+                f"📰 الأخبار: {news_msg}\n"
+                f"⚖️ السوق (Hurst): {hurst} (فوق 0.5 ترند | تحت 0.5 تذبذب)\n"
+                f"📏 متوسط الحركة (ADR): {adr}\n"
+                f"🔥 سيولة: فوق {hidden_above} | تحت {hidden_below}\n"
+                f"📊 SMC: {smc_status}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧐 *الوضع:* لا يوجد توافق فالفريمات دابا. البوت كيراقب الضربات النقية."
+            )
+            return {"type": "REPORT", "msg": report}, None
 
-        if signal_dir == 1 and macro_bias == "BEARISH_GOLD": return None, None
-        if signal_dir == -1 and macro_bias == "BULLISH_GOLD": return None, None
-        if abs(corr) < 0.3: return None, None
+        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nسيولة: {hidden_above}/{hidden_below}"
+        ai_verdict = await ask_ai_council(ai_summary)
+        
+        if "انتظار" in ai_verdict:
+            report = (
+                f"⚖️ *مجلس العباقرة رفض الصفقة*\n"
+                f"💰 السعر: `{current_price:.2f}`\n"
+                f"📊 SMC: {smc_status}\n"
+                f"🧠 *السبب:*\n{ai_verdict}"
+            )
+            return {"type": "REPORT", "msg": report}, None
 
-        if predicted:
-            if signal_dir == 1 and predicted < df_h1['Close'].iloc[-1]: return None, None
-            if signal_dir == -1 and predicted > df_h1['Close'].iloc[-1]: return None, None
-
-        current_price = df_m15['Close'].iloc[-1]
         atr_m15 = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
         entry = round(current_price, 2)
-
         if signal_dir == 1:
-            sl = round(ob_zone['bottom'] - (atr_m15 * 0.8), 2)
+            sl = round(m15_ob['bottom'] - (atr_m15 * 0.8), 2)
             tp1 = round(entry + (entry - sl) * 1.5, 2)
-            tp2 = round(entry + (entry - sl) * 2.5, 2)
             trade_type = "🟢 شراء كمي"
         else:
-            sl = round(ob_zone['top'] + (atr_m15 * 0.8), 2)
+            sl = round(m15_ob['top'] + (atr_m15 * 0.8), 2)
             tp1 = round(entry - (sl - entry) * 1.5, 2)
-            tp2 = round(entry - (sl - entry) * 2.5, 2)
             trade_type = "🔴 بيع كمي"
 
-        ai_verdict = "⚠️ AI غير مستعمل."
-        if use_ai:
-            ai_summary = f"""
-            - السعر: {current_price} | ADR: {adr}
-            - H4: {h4_msg} | H1: {h1_msg} | M15: {m15_msg}
-            - الماكرو: {macro_msg} | الارتباط: {corr} | Open Interest: {oi_msg}
-            - Hurst: {hurst} (فوق 0.5 ترند، تحت 0.5 تذبذب)
-            - Fib Golden Pocket: {fib_low} - {fib_high}
-            - توقع الشبكة: {predicted} | PCA: {pca_score}%
-            - السيولة: فوق {hidden_above} | تحت {hidden_below}
-            - نوع الإشارة الفنية: {trade_type}
-            """
-            ai_verdict = await ask_ai_council(ai_summary)
-            
-            if "انتظار" in ai_verdict:
-                logging.info("Council Vetoed the trade.")
-                return None, None
+        signal_report = (
+            f"👑 *إشارة الوحش 30.0*\n"
+            f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{trade_type}\n"
+            f"🎯 *الدخول:* `{entry}`\n"
+            f"🛑 *الوقف:* `{sl}`\n"
+            f"🏆 *الهدف:* `{tp1}`\n\n"
+            f"📊 SMC: {smc_status}\n"
+            f"💵 الماكرو: {macro_msg}\n"
+            f"🧠 *AI:* {ai_verdict}"
+        )
+        return {"type": "SIGNAL", "msg": signal_report}, None
 
-        payload = {
-            "time": str(df_m15.index[-1]), "type": trade_type,
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-            "macro": macro_msg, "smc": f"H4: {h4_msg}\nH1: {h1_msg}\nM15: {m15_msg}",
-            "corr": f"🔗 الارتباط: {corr}", "nn": f"🧬 توقع الشبكة: {predicted}",
-            "heat": f"🔥 POC: {poc}", 
-            "dark": f"🔮 PCA: {pca_score}% | ⚫ سيولة: فوق {hidden_above} | تحت {hidden_below}",
-            "hidden_science": f"🔬 Hurst: {hurst} | 📏 ADR: {adr} | 🧬 OI: {oi_msg}\n🎯 Fib Pocket: {fib_low} - {fib_high}",
-            "ai": ai_verdict
-        }
-        return payload, None
     except Exception as e:
         return None, f"❌ خطأ: {e}"
 
-# ==========================================
-# 📱 واجهة تليجرام
-# ==========================================
-def format_card(sig):
-    now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
-    return (
-        f"👑 *الوحش 29.0 (Multi-AI)*\n"
-        f"🕐 *وقت التحليل:* `{now_ma}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{sig['type']}\n\n"
-        f"🎯 *الدخول:* `{sig['entry']:.2f}`\n"
-        f"🛑 *الوقف:* `{sig['sl']:.2f}`\n"
-        f"🏆 *الهدف 1:* `{sig['tp1']:.2f}`\n"
-        f"🚀 *الهدف 2:* `{sig['tp2']:.2f}`\n\n"
-        f"📊 *SMC:*\n{sig['smc']}\n"
-        f"{sig['corr']}\n"
-        f"{sig['nn']}\n"
-        f"{sig['heat']}\n"
-        f"{sig['dark']}\n"
-        f"{sig['hidden_science']}\n"
-        f"💵 *الماكرو:* {sig['macro']}\n\n"
-        f"🧠 *مجلس العباقرة:*\n{sig['ai']}\n"
-    )
-
-# ==========================================
-# 🚀 التشغيل الرئيسي (ماشي كينعس، وكيمنع التكرار)
-# ==========================================
 async def main():
-    now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
-    in_killzone = is_in_killzone()
+    payload, err = await run_engine()
     
-    # البوت كيدير التحليل فكل مرة (سيولة ولا ماشي سيولة)
-    sig, err = await run_engine(use_ai=True)
+    if err:
+        await send_telegram_msg(f"⚠️ *خطأ:*\n{err}")
+        return
 
-    if sig:
-        # منع التكرار (Anti-Spam)
-        current_signal_hash = f"{sig['type']}_{sig['entry']}_{sig['sl']}_{sig['tp1']}"
-        last_signal_hash = db_get("last_signal_hash")
-        last_signal_time = db_get("last_signal_time")
+    if payload:
+        msg = payload["msg"]
+        msg_type = payload["type"]
 
-        if current_signal_hash == last_signal_hash and last_signal_time:
-            try:
-                last_time_dt = datetime.fromisoformat(last_signal_time)
-                time_diff = (datetime.now() - last_time_dt).total_seconds() / 60
-                if time_diff < 60: # إلا كان فات أقل من ساعة على نفس الإشارة
-                    logging.info("Duplicate signal ignored.")
-                    # كيصيفط رسالة صغيرة غير باش يطمنك، ولكن ماشي الإشارة كاملة
-                    status_msg = f"⏳ *تحديث:* (الوقت: {now_ma})\nنفس الصفقة اللي صيفطتها قبل {int(time_diff)} دقيقة مازال صالحة. كنسناو تغيير فالسوق."
-                    await send_telegram_msg(status_msg)
-                    return
-            except Exception:
-                pass
-
-        # إلا كانت إشارة جديدة، نسجلوها ونصيفطوها
-        db_set("last_signal_hash", current_signal_hash)
-        db_set("last_signal_time", str(datetime.now()))
-        
-        card = format_card(sig)
-        prefix = "🚨 *إشارة سيولة*" if in_killzone else "👀 *إشارة مراقبة*"
-        await send_telegram_msg(f"{prefix} (الوقت: {now_ma})\n\n{card}")
-
-    elif err:
-        if "درع الأخبار" in err:
-            await send_telegram_msg(f"⚠️ *تنبيه:*\n{err}")
-        else:
-            logging.warning(err)
-    else:
-        # إلا ما لقاش صفقة، كيصيفط رسالة باش يطمنك
-        status = "🔍 *تحليل سيولة مكتمل*" if in_killzone else "👀 *مراقبة خارج السيولة*"
-        await send_telegram_msg(f"{status} (الوقت: {now_ma})\nالبوت دار التحليل الشامل بكل العلوم (SMC, AI, Hurst, ADR)، ولكن ما لقاش صفقة ناضجة دابا. كنسناو فرصة أحسن.")
+        if msg_type == "REPORT":
+            last_report = db_get("last_report_time")
+            current_time = datetime.now().strftime("%Y-%m-%d %H")
+            if last_report == current_time:
+                logging.info("Report already sent this hour.")
+                return
+            db_set("last_report_time", current_time)
+            
+        await send_telegram_msg(msg)
 
 if __name__ == '__main__':
     asyncio.run(main())
