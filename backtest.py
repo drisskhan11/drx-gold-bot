@@ -3,94 +3,97 @@ import pandas as pd
 import numpy as np
 
 def run_backtest():
-    print("🚀 بدء الاختبار التاريخي (استراتيجية SMC الحقيقية)...")
+    print("🚀 بدء الاختبار التاريخي (Quantum Liquidity Engine)...")
     try:
         ticker = yf.Ticker("GC=F")
-        # جلب بيانات الساعة لسنتين
         df = ticker.history(period="2y", interval="1h")
         
         if df.empty:
             print("❌ تعذر جلب البيانات.")
             return
 
+        lookback = 20
         wins = 0
         losses = 0
-        timeouts = 0
+        breakevens = 0
         total_trades = 0
-        total_profit = 0.0
+        profit = 0.0
 
-        # حساب ATR
         df['ATR'] = (df['High'] - df['Low']).rolling(14).mean()
-        
-        # البحث عن ضربات السيولة (Liquidity Sweeps)
-        for i in range(20, len(df) - 24): # كنقلبو على 24 ساعة بعد الدخول
-            current_close = df['Close'].iloc[i]
-            current_low = df['Low'].iloc[i]
-            current_high = df['High'].iloc[i]
-            current_open = df['Open'].iloc[i]
-            atr = df['ATR'].iloc[i]
+
+        for i in range(lookback, len(df) - 50):
+            recent_low = df['Low'].iloc[i-lookback:i].min()
+            recent_high = df['High'].iloc[i-lookback:i].max()
             
-            if pd.isna(atr): continue
+            sweep_low = df['Low'].iloc[i] < recent_low
+            sweep_high = df['High'].iloc[i] > recent_high
             
-            # الشموع اللي قبل (آخر 10 شموع)
-            past_lows = df['Low'].iloc[i-10:i]
-            past_highs = df['High'].iloc[i-10:i]
-            
-            recent_low = past_lows.min()
-            recent_high = past_highs.max()
-            
-            # 🟢 شراء: Liquidity Sweep للقاع + شمعة صاعدة
-            if current_low < recent_low and current_close > recent_low and current_close > current_open:
-                entry = current_close
-                sl = current_low - (atr * 0.5)
-                tp = entry + (atr * 2.0) # هدف ضعف الوقف
-                
-                for j in range(i+1, i+24): # كنعطيوه 24 ساعة باش يحقق
-                    if df['High'].iloc[j] >= tp:
-                        wins += 1
-                        total_profit += (tp - entry)
-                        break
-                    elif df['Low'].iloc[j] <= sl:
-                        losses += 1
-                        total_profit += (sl - entry)
-                        break
-                else:
-                    timeouts += 1
-                    total_profit += (df['Close'].iloc[i+23] - entry)
-                
-                total_trades += 1
-                continue
-                
-            # 🔴 بيع: Liquidity Sweep للقمة + شمعة هابطة
-            elif current_high > recent_high and current_close < recent_high and current_close < current_open:
-                entry = current_close
-                sl = current_high + (atr * 0.5)
-                tp = entry - (atr * 2.0)
-                
-                for j in range(i+1, i+24):
-                    if df['Low'].iloc[j] <= tp:
-                        wins += 1
-                        total_profit += (entry - tp)
-                        break
-                    elif df['High'].iloc[j] >= sl:
-                        losses += 1
-                        total_profit += (entry - sl)
-                        break
-                else:
-                    timeouts += 1
-                    total_profit += (entry - df['Close'].iloc[i+23])
-                
-                total_trades += 1
+            # 🟢 صيد سيولة القاع + إزاحة صاعدة
+            if sweep_low and df['Close'].iloc[i] > recent_low: 
+                body = abs(df['Close'].iloc[i] - df['Open'].iloc[i])
+                # شرط الإزاحة: الشمعة تكون قوية (أكبر من ATR بـ 1.2)
+                if body > df['ATR'].iloc[i] * 1.2: 
+                    entry = df['Close'].iloc[i]
+                    sl = df['Low'].iloc[i] - (df['ATR'].iloc[i] * 0.2)
+                    risk = entry - sl
+                    tp = entry + (risk * 3.0) # هدف 1:3
+                    be = entry + (risk * 1.0) # بريك إيفن 1:1
+                    
+                    hit_be = False
+                    for j in range(i+1, i+50):
+                        if df['High'].iloc[j] >= be and not hit_be:
+                            hit_be = True
+                            sl = entry # تحريك الوقف
+                        if df['High'].iloc[j] >= tp:
+                            wins += 1
+                            profit += (tp - entry)
+                            break
+                        elif df['Low'].iloc[j] <= sl:
+                            if hit_be:
+                                breakevens += 1
+                            else:
+                                losses += 1
+                                profit += (sl - entry)
+                            break
+                    total_trades += 1
+
+            # 🔴 صيد سيولة القمة + إزاحة هابطة
+            elif sweep_high and df['Close'].iloc[i] < recent_high:
+                body = abs(df['Close'].iloc[i] - df['Open'].iloc[i])
+                if body > df['ATR'].iloc[i] * 1.2:
+                    entry = df['Close'].iloc[i]
+                    sl = df['High'].iloc[i] + (df['ATR'].iloc[i] * 0.2)
+                    risk = sl - entry
+                    tp = entry - (risk * 3.0)
+                    be = entry - (risk * 1.0)
+                    
+                    hit_be = False
+                    for j in range(i+1, i+50):
+                        if df['Low'].iloc[j] <= be and not hit_be:
+                            hit_be = True
+                            sl = entry
+                        if df['Low'].iloc[j] <= tp:
+                            wins += 1
+                            profit += (entry - tp)
+                            break
+                        elif df['High'].iloc[j] >= sl:
+                            if hit_be:
+                                breakevens += 1
+                            else:
+                                losses += 1
+                                profit += (entry - sl)
+                            break
+                    total_trades += 1
 
         if total_trades > 0:
             win_rate = (wins / total_trades) * 100
-            print(f"\n📊 *نتائج اختبار SMC الحقيقية:*")
+            print(f"\n📊 *نتائج محرك السيولة الكمي:*")
             print(f"إجمالي الصفقات: {total_trades}")
-            print(f"الصفقات الرابحة: {wins}")
+            print(f"الصفقات الرابحة (1:3): {wins}")
             print(f"الصفقات الخاسرة: {losses}")
-            print(f"الصفقات المعلقة (Timeout): {timeouts}")
+            print(f"الصفقات المحمية (Breakeven): {breakevens}")
             print(f"نسبة النجاح (Win Rate): {win_rate:.2f}%")
-            print(f"إجمالي الربح/الخسارة: {total_profit:.2f} نقطة")
+            print(f"إجمالي الأرباح (بالنقاط): {profit:.2f} نقطة")
         else:
             print("⚠️ ما كاينش صفقات كافية.")
 
