@@ -32,4 +32,7 @@ jobs:
         BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python app.py
+      run: |
+  echo "BOT_TOKEN is set: ${{ secrets.BOT_TOKEN != '' }}"
+  echo "TELEGRAM_CHAT_ID is set: ${{ secrets.TELEGRAM_CHAT_ID != '' }}"
+  python app.py
