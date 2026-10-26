@@ -1,7 +1,9 @@
 name: Run Backtest
 
 on:
-  workflow_dispatch: # كيتشغل غير بيدك
+  workflow_dispatch: # كيتشغل يدوياً
+  push:
+    branches: [ main ] # كيتشغل أوتوماتيكياً ملي كنسجلو
 
 jobs:
   backtest:
