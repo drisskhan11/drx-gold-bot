@@ -1,66 +1,28 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
+name: Run Backtest
 
-def run_backtest():
-    print("🚀 بدء الاختبار التاريخي (نسخة محسنة)...")
-    try:
-        ticker = yf.Ticker("GC=F")
-        df = ticker.history(period="1y", interval="1d")
-        
-        if df.empty:
-            print("❌ تعذر جلب البيانات.")
-            return
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
 
-        wins = 0
-        losses = 0
-        total_trades = 0
-        total_profit = 0.0
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
 
-        # الاختبار من الشمعة 50 حتى الآخر
-        for i in range(50, len(df) - 10):
-            current_price = df['Close'].iloc[i]
-            atr = (df['High'] - df['Low']).iloc[i-14:i].mean()
-            
-            # شروط الشراء (Trend Following)
-            if df['Close'].iloc[i] > df['Close'].iloc[i-20:i].mean():
-                entry = current_price
-                sl = entry - (atr * 1.5)
-                tp = entry + (atr * 3.0)
-                
-                # نمشيو مع الشموع اللي من بعد باش نشوفو واش ضرب الهدف ولا الوقف
-                for j in range(i+1, min(i+50, len(df))): # كنعطيوها 50 شمعة باش تحقق
-                    high = df['High'].iloc[j]
-                    low = df['Low'].iloc[j]
-                    
-                    if high >= tp:
-                        wins += 1
-                        total_profit += (tp - entry)
-                        break
-                    elif low <= sl:
-                        losses += 1
-                        total_profit += (sl - entry)
-                        break
-                else:
-                    # إلا سالات 50 شمعة وما ضربت لا هدف لا وقف، كنحسبوها على سعر الإغلاق
-                    losses += 1
-                    total_profit += (df['Close'].iloc[min(i+50, len(df)-1)] - entry)
-                    
-                total_trades += 1
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-        if total_trades > 0:
-            win_rate = (wins / total_trades) * 100
-            print(f"\n📊 *نتائج الاختبار الحقيقية:*")
-            print(f"إجمالي الصفقات: {total_trades}")
-            print(f"الصفقات الرابحة: {wins}")
-            print(f"الصفقات الخاسرة: {losses}")
-            print(f"نسبة النجاح (Win Rate): {win_rate:.2f}%")
-            print(f"إجمالي الربح/الخسارة: {total_profit:.2f} نقطة")
-        else:
-            print("⚠️ ما كاينش صفقات كافية.")
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
 
-    except Exception as e:
-        print(f"❌ خطأ: {e}")
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
 
-if __name__ == '__main__':
-    run_backtest()
+    - name: Run Backtest
+      run: python backtest.py
