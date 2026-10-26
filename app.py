@@ -41,6 +41,16 @@ except Exception as e:
     ai_enabled = False
 
 # ==========================================
+# 📱 دالة إرسال رسالة لتيليجرام
+# ==========================================
+async def send_telegram_msg(text):
+    try:
+        bot = telegram.Bot(token=TOKEN)
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Telegram Send Error: {e}")
+
+# ==========================================
 # 🗄️ قاعدة البيانات
 # ==========================================
 def init_db():
@@ -382,7 +392,7 @@ async def run_engine(use_ai=True):
 def format_card(sig):
     now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
     return (
-        f"👑 *الوحش 28.0 (Multi-AI)*\n"
+        f"👑 *الوحش 28.1 (Multi-AI)*\n"
         f"🕐 *وقت التحليل:* `{now_ma}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{sig['type']}\n\n"
@@ -400,19 +410,31 @@ def format_card(sig):
         f"🧠 *مجلس العباقرة:*\n{sig['ai']}\n"
     )
 
+# ==========================================
+# 🚀 التشغيل الرئيسي مع النبضات
+# ==========================================
 async def main():
+    now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 1. التحقق من الوقت (Killzone)
     if not is_in_killzone():
         logging.info("خارج أوقات السيولة.")
+        await send_telegram_msg(f"💤 *البوت خدام مزيان* (الوقت: {now_ma})\nولكن دابا خارج أوقات السيولة (Killzone). غادي نبدا نحلل السوق فاش يتحل.")
         return
 
+    # 2. البوت داخل السيولة، كيبدا التحليل
+    await send_telegram_msg(f"⚡ *البوت بدا التحليل* (الوقت: {now_ma})\nراني كنقلب على الصفقة...")
+    
     sig, err = await run_engine(use_ai=True)
-    bot = telegram.Bot(token=TOKEN)
 
+    # 3. إرسال النتيجة
     if err:
-        await bot.send_message(chat_id=CHAT_ID, text=err)
+        await send_telegram_msg(f"⚠️ *تنبيه:*\n{err}")
     elif sig:
         card = format_card(sig)
-        await bot.send_message(chat_id=CHAT_ID, text=card, parse_mode='Markdown')
+        await send_telegram_msg(card)
+    else:
+        await send_telegram_msg(f"🔍 *تحليل مكتمل* (الوقت: {now_ma})\nالبوت دار التحليل الشامل، ولكن ما لقاش صفقة ناضجة دابا. كنسناو فرصة أحسن.")
 
 if __name__ == '__main__':
     asyncio.run(main())
