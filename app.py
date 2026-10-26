@@ -21,11 +21,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==========================================
 # ⚙️ الإعدادات
 # ==========================================
-TOKEN = os.environ.get("BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 DB_FILE = "quantum_beast_28.db"
 KILLZONE_LONDON = (2.0, 5.0)
@@ -250,7 +250,7 @@ async def ask_ai_council(data_summary):
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة واحدة]
     """
     
-    # 1. المحاولة الأولى: Gemini
+    # 1. Gemini
     if ai_enabled:
         try:
             response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
@@ -258,7 +258,7 @@ async def ask_ai_council(data_summary):
         except Exception as e:
             logging.warning(f"Gemini failed: {e}. Falling back to Groq.")
 
-    # 2. المحاولة الثانية: Groq
+    # 2. Groq
     if GROQ_API_KEY:
         try:
             client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
@@ -270,7 +270,7 @@ async def ask_ai_council(data_summary):
         except Exception as e:
             logging.warning(f"Groq failed: {e}. Falling back to OpenRouter.")
 
-    # 3. المحاولة الثالثة: OpenRouter
+    # 3. OpenRouter
     if OPENROUTER_API_KEY:
         try:
             client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
@@ -392,7 +392,7 @@ async def run_engine(use_ai=True):
 def format_card(sig):
     now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
     return (
-        f"👑 *الوحش 28.1 (Multi-AI)*\n"
+        f"👑 *الوحش 29.0 (Multi-AI)*\n"
         f"🕐 *وقت التحليل:* `{now_ma}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{sig['type']}\n\n"
@@ -411,30 +411,51 @@ def format_card(sig):
     )
 
 # ==========================================
-# 🚀 التشغيل الرئيسي مع النبضات
+# 🚀 التشغيل الرئيسي (ماشي كينعس، وكيمنع التكرار)
 # ==========================================
 async def main():
     now_ma = datetime.now(ZoneInfo("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
+    in_killzone = is_in_killzone()
     
-    # 1. التحقق من الوقت (Killzone)
-    if not is_in_killzone():
-        logging.info("خارج أوقات السيولة.")
-        await send_telegram_msg(f"💤 *البوت خدام مزيان* (الوقت: {now_ma})\nولكن دابا خارج أوقات السيولة (Killzone). غادي نبدا نحلل السوق فاش يتحل.")
-        return
-
-    # 2. البوت داخل السيولة، كيبدا التحليل
-    await send_telegram_msg(f"⚡ *البوت بدا التحليل* (الوقت: {now_ma})\nراني كنقلب على الصفقة...")
-    
+    # البوت كيدير التحليل فكل مرة (سيولة ولا ماشي سيولة)
     sig, err = await run_engine(use_ai=True)
 
-    # 3. إرسال النتيجة
-    if err:
-        await send_telegram_msg(f"⚠️ *تنبيه:*\n{err}")
-    elif sig:
+    if sig:
+        # منع التكرار (Anti-Spam)
+        current_signal_hash = f"{sig['type']}_{sig['entry']}_{sig['sl']}_{sig['tp1']}"
+        last_signal_hash = db_get("last_signal_hash")
+        last_signal_time = db_get("last_signal_time")
+
+        if current_signal_hash == last_signal_hash and last_signal_time:
+            try:
+                last_time_dt = datetime.fromisoformat(last_signal_time)
+                time_diff = (datetime.now() - last_time_dt).total_seconds() / 60
+                if time_diff < 60: # إلا كان فات أقل من ساعة على نفس الإشارة
+                    logging.info("Duplicate signal ignored.")
+                    # كيصيفط رسالة صغيرة غير باش يطمنك، ولكن ماشي الإشارة كاملة
+                    status_msg = f"⏳ *تحديث:* (الوقت: {now_ma})\nنفس الصفقة اللي صيفطتها قبل {int(time_diff)} دقيقة مازال صالحة. كنسناو تغيير فالسوق."
+                    await send_telegram_msg(status_msg)
+                    return
+            except Exception:
+                pass
+
+        # إلا كانت إشارة جديدة، نسجلوها ونصيفطوها
+        db_set("last_signal_hash", current_signal_hash)
+        db_set("last_signal_time", str(datetime.now()))
+        
         card = format_card(sig)
-        await send_telegram_msg(card)
+        prefix = "🚨 *إشارة سيولة*" if in_killzone else "👀 *إشارة مراقبة*"
+        await send_telegram_msg(f"{prefix} (الوقت: {now_ma})\n\n{card}")
+
+    elif err:
+        if "درع الأخبار" in err:
+            await send_telegram_msg(f"⚠️ *تنبيه:*\n{err}")
+        else:
+            logging.warning(err)
     else:
-        await send_telegram_msg(f"🔍 *تحليل مكتمل* (الوقت: {now_ma})\nالبوت دار التحليل الشامل، ولكن ما لقاش صفقة ناضجة دابا. كنسناو فرصة أحسن.")
+        # إلا ما لقاش صفقة، كيصيفط رسالة باش يطمنك
+        status = "🔍 *تحليل سيولة مكتمل*" if in_killzone else "👀 *مراقبة خارج السيولة*"
+        await send_telegram_msg(f"{status} (الوقت: {now_ma})\nالبوت دار التحليل الشامل بكل العلوم (SMC, AI, Hurst, ADR)، ولكن ما لقاش صفقة ناضجة دابا. كنسناو فرصة أحسن.")
 
 if __name__ == '__main__':
     asyncio.run(main())
