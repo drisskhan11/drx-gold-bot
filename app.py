@@ -15,9 +15,14 @@ from sklearn.decomposition import PCA
 import telegram
 from openai import OpenAI
 
-# ✅ المكتبات الجديدة
-from tickerlayer import TickerLayer
-from flashalpha import FlashAlpha
+# ✅ الاستيراد الصحيح للمكتبات الجديدة
+try:
+    from flashalpha import FlashAlpha
+    from tickerlayer import TickerLayer
+    new_libs_enabled = True
+except ImportError as e:
+    logging.warning(f"New libraries not found: {e}")
+    new_libs_enabled = False
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,7 +36,6 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# ✅ مفاتيح جديدة (زيدهم فـ GitHub Secrets)
 TICKERLAYER_API_KEY = os.environ.get("TICKERLAYER_API_KEY", "").strip()
 FLASHALPHA_API_KEY = os.environ.get("FLASHALPHA_API_KEY", "").strip()
 
@@ -48,9 +52,14 @@ except Exception as e:
     logging.error(f"AI Error: {e}")
     ai_enabled = False
 
-# ✅ تهيئة TickerLayer و FlashAlpha
-tl_client = TickerLayer(TICKERLAYER_API_KEY) if TICKERLAYER_API_KEY else None
-fa_client = FlashAlpha(FLASHALPHA_API_KEY) if FLASHALPHA_API_KEY else None
+# ✅ تهيئة عملاء البيانات الجدد بحماية
+tl_client = None
+fa_client = None
+if new_libs_enabled:
+    if TICKERLAYER_API_KEY:
+        tl_client = TickerLayer(TICKERLAYER_API_KEY)
+    if FLASHALPHA_API_KEY:
+        fa_client = FlashAlpha(FLASHALPHA_API_KEY)
 
 # ==========================================
 # 📱 دالة إرسال رسالة لتيليجرام
@@ -88,36 +97,30 @@ def is_in_killzone():
     return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
-# ⚡ السعر الفوري (Real-time) عبر TickerLayer
+# ⚡ السعر الفوري (TickerLayer)
 # ==========================================
 async def get_live_price():
-    if not tl_client:
-        return None
+    if not tl_client: return None
     try:
-        # TickerLayer كيدعم XAUUSD مباشرة
         quote = tl_client.quote("commodities", "XAUUSD")
-        return quote.get('last_price') or quote.get('bid')
+        return quote.get('bid') or quote.get('ask') or quote.get('last_price')
     except Exception as e:
         logging.warning(f"TickerLayer failed: {e}")
         return None
 
 # ==========================================
-# 🔮 تحليل الجاما (Gamma) عبر FlashAlpha
+# 🔮 تحليل الجاما (FlashAlpha)
 # ==========================================
 async def get_gamma_analysis():
-    if not fa_client:
-        return None, None, None, None
+    if not fa_client: return None, None, None, None
     try:
-        # GLD هو صندوق الذهب المتداول، وبيانات الخيارات ديالو متوفرة
         gex = fa_client.gex("GLD")
-        
-        net_gex = gex.get('net_gex', 0)
+        net_gex = gex.get('net_gex')
         gamma_flip = gex.get('gamma_flip')
-        flip_status = gex.get('gamma_flip_status')
         
         levels = fa_client.exposure_levels("GLD")
-        call_wall = levels['levels'].get('call_wall')
-        put_wall = levels['levels'].get('put_wall')
+        call_wall = levels.get('levels', {}).get('call_wall')
+        put_wall = levels.get('levels', {}).get('put_wall')
         
         return net_gex, gamma_flip, call_wall, put_wall
     except Exception as e:
@@ -132,25 +135,24 @@ async def fetch_data(symbol, period, interval):
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval)
         if not df.empty: return df
-    except Exception as e:
-        logging.warning(f"Primary symbol {symbol} failed: {e}")
+    except Exception:
+        pass
 
     try:
         fallback_symbol = "XAUUSD=X" if symbol == "GC=F" else symbol
         ticker = yf.Ticker(fallback_symbol)
         df = ticker.history(period=period, interval=interval)
         if not df.empty: return df
-    except Exception as e:
-        logging.warning(f"Fallback symbol {fallback_symbol} failed: {e}")
+    except Exception:
+        pass
 
     if symbol == "GC=F":
         try:
             ticker = yf.Ticker("GLD")
             df = ticker.history(period=period, interval=interval)
             if not df.empty: return df
-        except Exception as e:
-            logging.warning(f"GLD failed: {e}")
-
+        except Exception:
+            pass
     return None
 
 # ==========================================
@@ -296,31 +298,21 @@ def is_news_dangerous():
         return False, "تعذر جلب الأخبار"
 
 # ==========================================
-# 🧠 إدارة حجم المركز (Position Sizing)
+# 🧠 إدارة حجم المركز (Kelly)
 # ==========================================
 def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
-    """
-    حساب حجم المركز باستخدام Kelly Criterion المصغر + ATR.
-    account_balance: رأس المال (مثلاً 1000$)
-    entry: سعر الدخول
-    sl: سعر وقف الخسارة
-    kelly_fraction: نسبة Kelly (0.5 يعني نصف كيلي، محافظ)
-    """
     risk_per_unit = abs(entry - sl)
     if risk_per_unit == 0: return 0.01
-    
-    # نفترضو نسبة نجاح 45% ومعدل ربح 2.5 (1:2.5)
     win_rate = 0.45
     reward_ratio = 2.5
     kelly = (win_rate * reward_ratio - (1 - win_rate)) / reward_ratio
-    kelly = max(0.01, kelly * kelly_fraction) # نخدمو بنصف كيلي باش نكونو محافظين
-    
+    kelly = max(0.01, kelly * kelly_fraction)
     risk_amount = account_balance * kelly
-    lot_size = risk_amount / (risk_per_unit * 100) # تقريباً لكل 100 وحدة
+    lot_size = risk_amount / (risk_per_unit * 100)
     return max(0.01, round(lot_size, 2))
 
 # ==========================================
-# 🧠 مجلس العباقرة (Multi-Provider AI)
+# 🧠 مجلس العباقرة (Multi-AI)
 # ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
@@ -329,7 +321,7 @@ async def ask_ai_council(data_summary):
     {data_summary}
 
     المطلوب منك أن تلعب الأدوار الثلاثة بالدارجة المغربية:
-    1. 🧠 [المحلل الفني]: قدم حجة بناءً على المعطيات (SMC, PCA, Hurst, Fib, Gamma).
+    1. 🧠 [المحلل الفني]: قدم حجة بناءً على المعطيات.
     2. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل.
     3. ⚖️ [مدير المخاطر]: أعطي القرار النهائي (شراء / بيع / انتظار).
     الرد يجب أن يكون بهذا الشكل:
@@ -357,7 +349,7 @@ async def ask_ai_council(data_summary):
     return "⚠️ AI غير متاح دابا."
 
 # ==========================================
-# 🚀 المحرك الرئيسي (مع Gamma و Real-time)
+# 🚀 المحرك الرئيسي
 # ==========================================
 async def run_engine():
     try:
@@ -372,7 +364,6 @@ async def run_engine():
         if any(d is None for d in [df_d1, df_h4, df_h1, df_m15]):
             return None, "❌ تعذر جلب بيانات."
 
-        # ✅ السعر الفوري (Real-time)
         live_price = await get_live_price()
         current_price = live_price if live_price else df_m15['Close'].iloc[-1]
 
@@ -385,28 +376,22 @@ async def run_engine():
         poc, hot_zones = calculate_heatmap(df_h1)
         hidden_above, hidden_below = market_maker_simulation(df_h1)
 
-        # ✅ تحليل الجاما
         net_gex, gamma_flip, call_wall, put_wall = await get_gamma_analysis()
 
         if news_danger:
-            report = f"🚨 *تحذير أخبار:* {news_msg}\n⚠️ كنسناو الخبر يفوت باش ندخلو."
-            return {"type": "NEWS", "msg": report}, None
+            return {"type": "NEWS", "msg": f"🚨 *تحذير أخبار:* {news_msg}"}, None
 
         smc_status = f"H4: {h4_msg}\nH1: {h1_msg}\nM15: {m15_msg}"
         
-        # ✅ بوابة إعادة التسعير (Repricing Gate)
-        # ما ندخلوش إلا إلا كان الاتجاه متوافق مع المتوسطات
         repricing_gate = True
-        if h4_dir == 1 and df_h1['Close'].iloc[-1] < df_h1['Close'].ewm(span=50).mean().iloc[-1]:
-            repricing_gate = False
-        if h4_dir == -1 and df_h1['Close'].iloc[-1] > df_h1['Close'].ewm(span=50).mean().iloc[-1]:
-            repricing_gate = False
+        if h4_dir == 1 and df_h1['Close'].iloc[-1] < df_h1['Close'].ewm(span=50).mean().iloc[-1]: repricing_gate = False
+        if h4_dir == -1 and df_h1['Close'].iloc[-1] > df_h1['Close'].ewm(span=50).mean().iloc[-1]: repricing_gate = False
 
         signal_dir = 0
-        if h4_dir == 1 and h1_dir == 1 and m15_dir == 1 and repricing_gate:
-            signal_dir = 1
-        elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1 and repricing_gate:
-            signal_dir = -1
+        if h4_dir == 1 and h1_dir == 1 and m15_dir == 1 and repricing_gate: signal_dir = 1
+        elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1 and repricing_gate: signal_dir = -1
+
+        gamma_status = f"GEX={net_gex}" if net_gex else "غير متاح"
 
         if signal_dir == 0:
             report = (
@@ -419,24 +404,18 @@ async def run_engine():
                 f"⚖️ السوق (Hurst): {hurst}\n"
                 f"📏 متوسط الحركة (ADR): {adr}\n"
                 f"🔥 سيولة: فوق {hidden_above} | تحت {hidden_below}\n"
-                f"🔮 الجاما: GEX={net_gex if net_gex else 'غير متاح'}\n"
+                f"🔮 الجاما: {gamma_status}\n"
                 f"📊 SMC: {smc_status}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🧐 *الوضع:* لا يوجد توافق فالفريمات دابا."
             )
             return {"type": "REPORT", "msg": report}, None
 
-        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nسيولة: {hidden_above}/{hidden_below}\nGamma: GEX={net_gex}, Flip={gamma_flip}, CallWall={call_wall}, PutWall={put_wall}"
+        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nسيولة: {hidden_above}/{hidden_below}\nGamma: {gamma_status}"
         ai_verdict = await ask_ai_council(ai_summary)
         
         if "انتظار" in ai_verdict:
-            report = (
-                f"⚖️ *مجلس العباقرة رفض الصفقة*\n"
-                f"💰 السعر: `{current_price:.2f}`\n"
-                f"📊 SMC: {smc_status}\n"
-                f"🧠 *السبب:*\n{ai_verdict}"
-            )
-            return {"type": "REPORT", "msg": report}, None
+            return {"type": "REPORT", "msg": f"⚖️ *مجلس العباقرة رفض الصفقة*\n{ai_verdict}"}, None
 
         atr_m15 = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
         entry = round(current_price, 2)
@@ -449,12 +428,10 @@ async def run_engine():
             tp1 = round(entry - (sl - entry) * 1.5, 2)
             trade_type = "🔴 بيع كمي"
 
-        # ✅ إدارة حجم المركز
-        account_balance = 1000.0 # يمكن تعديلها من إعدادات GitHub
-        lot_size = calculate_position_size(account_balance, entry, sl)
+        lot_size = calculate_position_size(1000.0, entry, sl)
 
         signal_report = (
-            f"👑 *إشارة الوحش 31.0*\n"
+            f"👑 *إشارة الوحش 31.1*\n"
             f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{trade_type}\n"
@@ -463,7 +440,7 @@ async def run_engine():
             f"🏆 *الهدف:* `{tp1}`\n\n"
             f"📦 *حجم المركز:* `{lot_size}` لوت\n"
             f"📊 SMC: {smc_status}\n"
-            f"🔮 الجاما: GEX={net_gex}, Flip={gamma_flip}\n"
+            f"🔮 الجاما: {gamma_status}\n"
             f"💵 الماكرو: {macro_msg}\n"
             f"🧠 *AI:* {ai_verdict}"
         )
