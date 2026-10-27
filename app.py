@@ -15,15 +15,6 @@ from openai import OpenAI
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
 
-# ✅ استيراد المكتبات الجديدة
-try:
-    from flashalpha import FlashAlpha
-    import eulerpool
-    new_libs_enabled = True
-except ImportError as e:
-    logging.warning(f"New libraries not found: {e}")
-    new_libs_enabled = False
-
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -35,10 +26,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-FLASHALPHA_API_KEY = os.environ.get("FLASHALPHA_API_KEY", "").strip()
-EULERPOOL_API_KEY = os.environ.get("EULERPOOL_API_KEY", "").strip()
 
-DB_FILE = "quantum_beast_34.db"
+DB_FILE = "quantum_beast_36.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
 
@@ -49,15 +38,6 @@ try:
     ai_enabled = True
 except Exception:
     ai_enabled = False
-
-# ✅ تهيئة العملاء (مع التصحيح)
-fa_client = None
-eu_client = None
-if new_libs_enabled:
-    if FLASHALPHA_API_KEY: 
-        fa_client = FlashAlpha(FLASHALPHA_API_KEY)
-    if EULERPOOL_API_KEY: 
-        eu_client = eulerpool.Eulerpool(EULERPOOL_API_KEY) # ✅ التصحيح هنا
 
 # ==========================================
 # 📱 إرسال تيليجرام
@@ -95,41 +75,7 @@ def is_in_killzone():
     return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
-# 🔮 تحليل الجاما (FlashAlpha)
-# ==========================================
-async def get_gamma_analysis():
-    if not fa_client: return "مفتاح ناقص", None, None, None
-    try:
-        gex = fa_client.gex("SPY")
-        net_gex = gex.get('net_gex')
-        gamma_flip = gex.get('gamma_flip')
-        status = gex.get('gamma_flip_status', 'unknown')
-        
-        gex_str = f"{net_gex:,.0f}" if net_gex is not None else "غير متاح"
-        flip_str = f"{gamma_flip:.2f}" if gamma_flip is not None and status == "available" else "غير محدد"
-        
-        return f"GEX={gex_str} | Flip={flip_str}", None, None, None
-    except Exception as e:
-        logging.warning(f"FlashAlpha failed: {e}")
-        return f"خطأ: {str(e)[:20]}", None, None, None
-
-# ==========================================
-# 💰 تدفقات GLD (eulerpool)
-# ==========================================
-async def get_gld_flows():
-    if not eu_client: return "مفتاح ناقص"
-    try:
-        # ملاحظة: قد تحتاج لتعديل هاد الدالة حسب توثيق eulerpool
-        flows = eu_client.etf.flows("GLD") 
-        if flows and 'net_flow' in flows:
-            return f"${flows['net_flow']:,.0f}"
-        return "غير متاح"
-    except Exception as e:
-        logging.warning(f"Eulerpool GLD flows failed: {e}")
-        return "خطأ فالاتصال"
-
-# ==========================================
-# 🌐 جلب البيانات (yfinance)
+# 🌐 جلب البيانات (yfinance فقط)
 # ==========================================
 async def fetch_data(symbol, period, interval):
     try:
@@ -145,7 +91,83 @@ async def fetch_data(symbol, period, interval):
     return None
 
 # ==========================================
-# 🧠 العلوم المخفية
+# 🌪️ تحليل VIX (مؤشر الخوف)
+# ==========================================
+async def get_vix_analysis():
+    try:
+        vix_data = await fetch_data("^VIX", "5d", "1h")
+        if vix_data is None or len(vix_data) < 20:
+            return "NEUTRAL", "بيانات غير كافية"
+        
+        current_vix = vix_data['Close'].iloc[-1]
+        vix_ema = vix_data['Close'].ewm(span=20).mean().iloc[-1]
+        
+        if current_vix > 25 and current_vix > vix_ema:
+            return "HIGH_FEAR", f"خوف عالي ({current_vix:.1f}) - دعم للذهب"
+        elif current_vix < 15 and current_vix < vix_ema:
+            return "LOW_FEAR", f"خوف منخفض ({current_vix:.1f}) - ضغط على الذهب"
+        else:
+            return "NEUTRAL", f"طبيعي ({current_vix:.1f})"
+    except Exception as e:
+        logging.warning(f"VIX analysis failed: {e}")
+        return "NEUTRAL", "خطأ"
+
+# ==========================================
+# 📊 كشف التباعد بين السعر والفوليوم
+# ==========================================
+def detect_volume_divergence(df, label):
+    if df is None or len(df) < 20:
+        return False, "بيانات غير كافية"
+    
+    try:
+        recent = df.tail(10)
+        price_trend = recent['Close'].iloc[-1] - recent['Close'].iloc[0]
+        volume_trend = recent['Volume'].iloc[-1] - recent['Volume'].iloc[0]
+        
+        # تباعد هبوطي: السعر طالع، الفوليوم هابط
+        if price_trend > 0 and volume_trend < 0:
+            return True, f"⚠️ {label}: تباعد هبوطي (السعر طالع، الفوليوم هابط)"
+        
+        # تباعد صعودي: السعر هابط، الفوليوم طالع
+        elif price_trend < 0 and volume_trend > 0:
+            return True, f"⚠️ {label}: تباعد صعودي (السعر هابط، الفوليوم طالع)"
+        
+        return False, f"✅ {label}: لا يوجد تباعد"
+    except Exception as e:
+        return False, f"خطأ: {e}"
+
+# ==========================================
+# 🕯️ مؤشر Heikin-Ashi (لتصفية الضوضاء)
+# ==========================================
+def calculate_heikin_ashi(df):
+    try:
+        ha_df = df.copy()
+        ha_df['HA_Close'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
+        ha_df['HA_Open'] = (df['Open'].shift(1) + df['Close'].shift(1)) / 2
+        ha_df['HA_High'] = ha_df[['High', 'HA_Open', 'HA_Close']].max(axis=1)
+        ha_df['HA_Low'] = ha_df[['Low', 'HA_Open', 'HA_Close']].min(axis=1)
+        return ha_df
+    except:
+        return df
+
+# ==========================================
+# 📉 مؤشر Stochastic RSI (للعلوم الكمومية)
+# ==========================================
+def calculate_stoch_rsi(df, period=14):
+    try:
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        stoch_rsi = (rsi - rsi.rolling(period).min()) / (rsi.rolling(period).max() - rsi.rolling(period).min())
+        return stoch_rsi.iloc[-1] * 100
+    except:
+        return 50.0
+
+# ==========================================
+# 🧠 العلوم المخفية (Hurst, ADR, SMC)
 # ==========================================
 def calculate_hurst_exponent(price_series, max_lag=20):
     try:
@@ -163,9 +185,6 @@ def calculate_adr(df_d1):
         return round(df_d1['Range'].rolling(14).mean().iloc[-1], 2)
     except: return 0
 
-# ==========================================
-# 🧠 SMC والمؤشرات
-# ==========================================
 def analyze_smc(df, label):
     if df is None or len(df) < 50: return 0, None, f"{label}: بيانات غير كافية"
     try:
@@ -202,12 +221,6 @@ def market_maker_simulation(df):
         low = df['Low'].tail(20).min()
         return round(high + (high - low) * 0.2, 2), round(low - (high - low) * 0.2, 2)
     except: return None, None
-
-def calculate_correlation(gold_df, dxy_df):
-    try:
-        if gold_df is None or dxy_df is None or len(gold_df) < 50: return 0.0
-        return round(gold_df['Close'].tail(50).reset_index(drop=True).corr(dxy_df['Close'].tail(50).reset_index(drop=True)), 2)
-    except: return 0.0
 
 def ai_predict_price(df):
     try:
@@ -265,7 +278,7 @@ def is_news_dangerous():
     except: return False, "تعذر جلب الأخبار"
 
 # ==========================================
-# 🧠 إدارة حجم المركز (Position Sizing)
+# 🧠 إدارة حجم المركز (Kelly)
 # ==========================================
 def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     risk_per_unit = abs(entry - sl)
@@ -341,8 +354,19 @@ async def run_engine():
         adr = calculate_adr(df_d1)
         poc, hot_zones = calculate_heatmap(df_h1)
         hidden_above, hidden_below = market_maker_simulation(df_h1)
-        gamma_status, _, _, _ = await get_gamma_analysis()
-        gld_flow = await get_gld_flows()
+        
+        # ✅ VIX
+        vix_status, vix_msg = await get_vix_analysis()
+        
+        # ✅ Volume Divergence
+        vol_div, vol_div_msg = detect_volume_divergence(df_h1, "H1")
+        
+        # ✅ Heikin-Ashi
+        ha_df = calculate_heikin_ashi(df_m15)
+        ha_trend = "BULLISH" if ha_df['HA_Close'].iloc[-1] > ha_df['HA_Open'].iloc[-1] else "BEARISH"
+        
+        # ✅ Stochastic RSI
+        stoch_rsi_val = calculate_stoch_rsi(df_m15)
 
         if news_danger:
             return {"type": "NEWS", "msg": f"🚨 *تحذير أخبار:* {news_msg}"}, None
@@ -365,25 +389,34 @@ async def run_engine():
                 f"💰 السعر: `{current_price:.2f}`\n"
                 f"💵 الدولار: {macro_msg}\n"
                 f"📰 الأخبار: {news_msg}\n"
+                f"🌪️ VIX: {vix_msg}\n"
+                f"📊 Volume Divergence: {vol_div_msg}\n"
+                f"🕯️ Heikin-Ashi: {ha_trend}\n"
+                f"📉 Stochastic RSI: {stoch_rsi_val:.1f}\n"
                 f"⚖️ السوق (Hurst): {hurst}\n"
                 f"📏 متوسط الحركة (ADR): {adr}\n"
                 f"🔥 سيولة: فوق {hidden_above} | تحت {hidden_below}\n"
-                f"🔮 الجاما: {gamma_status}\n"
-                f"💰 تدفقات GLD: {gld_flow}\n"
                 f"📊 SMC: {smc_status}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🧐 *الوضع:* لا يوجد توافق فالفريمات دابا."
             )
             return {"type": "REPORT", "msg": report}, None
 
-        if gld_flow and "خطأ" not in gld_flow and "ناقص" not in gld_flow:
-            try:
-                flow_val = float(gld_flow.replace('$', '').replace(',', '').replace(' ', ''))
-                if signal_dir == 1 and flow_val < -50:
-                    return {"type": "REPORT", "msg": f"🚫 *فلتر GLD:* تدفقات سلبية بقوة ({gld_flow}). لا يُنصح بالشراء."}, None
-            except: pass
+        # ✅ فلتر VIX
+        if signal_dir == 1 and vix_status == "LOW_FEAR":
+            return {"type": "REPORT", "msg": f"🚫 *فلتر VIX:* خوف منخفض ({vix_msg}). لا يُنصح بالشراء."}, None
+        
+        # ✅ فلتر Volume Divergence
+        if vol_div and signal_dir == 1:
+            return {"type": "REPORT", "msg": f"🚫 *فلتر Volume Divergence:* {vol_div_msg}. لا يُنصح بالشراء."}, None
+        
+        # ✅ فلتر Heikin-Ashi
+        if signal_dir == 1 and ha_trend == "BEARISH":
+            return {"type": "REPORT", "msg": f"🚫 *فلتر Heikin-Ashi:* الاتجاه هابط. لا يُنصح بالشراء."}, None
+        if signal_dir == -1 and ha_trend == "BULLISH":
+            return {"type": "REPORT", "msg": f"🚫 *فلتر Heikin-Ashi:* الاتجاه صاعد. لا يُنصح بالبيع."}, None
 
-        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nسيولة: {hidden_above}/{hidden_below}\nGamma: {gamma_status}\nGLD Flows: {gld_flow}"
+        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nVIX: {vix_msg}\nVolume Divergence: {vol_div_msg}\nHeikin-Ashi: {ha_trend}\nStoch RSI: {stoch_rsi_val:.1f}"
         ai_verdict = await ask_ai_council(ai_summary)
         
         if "انتظار" in ai_verdict:
@@ -403,7 +436,7 @@ async def run_engine():
         lot_size = calculate_position_size(1000.0, entry, sl)
 
         signal_report = (
-            f"👑 *إشارة الوحش 34.0*\n"
+            f"👑 *إشارة الوحش 36.0*\n"
             f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{trade_type}\n"
@@ -412,8 +445,10 @@ async def run_engine():
             f"🏆 *الهدف:* `{tp1}`\n\n"
             f"📦 *حجم المركز:* `{lot_size}` لوت\n"
             f"📊 SMC: {smc_status}\n"
-            f"🔮 الجاما: {gamma_status}\n"
-            f"💰 تدفقات GLD: {gld_flow}\n"
+            f"🌪️ VIX: {vix_msg}\n"
+            f"📊 Volume Divergence: {vol_div_msg}\n"
+            f"🕯️ Heikin-Ashi: {ha_trend}\n"
+            f"📉 Stochastic RSI: {stoch_rsi_val:.1f}\n"
             f"💵 الماكرو: {macro_msg}\n"
             f"🧠 *AI:* {ai_verdict}"
         )
