@@ -11,9 +11,11 @@ import pandas as pd
 import numpy as np
 import requests
 import telegram
-from openai import OpenAI
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
+
+# ✅ استيراد المكتبة الثورية
+from freellmpool import AsyncPool
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,54 +27,12 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-DB_FILE = "quantum_beast_38.db"
+DB_FILE = "quantum_beast_40.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
-
-try:
-    from google import genai
-    ai_client = genai.Client(api_key=GEMINI_API_KEY)
-    AI_MODEL = "gemini-3.5-flash-lite"
-    ai_enabled = True
-except Exception:
-    ai_enabled = False
-
-# ==========================================
-# 📱 إرسال تيليجرام
-# ==========================================
-async def send_telegram_msg(text):
-    try:
-        bot = telegram.Bot(token=TOKEN)
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
-    except Exception as e:
-        logging.error(f"Telegram Error: {e}")
-
-# ==========================================
-# 🗄️ قاعدة البيانات
-# ==========================================
-def init_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.executescript("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);")
-    conn.commit()
-    return conn
-
-conn = init_db()
-
-def db_get(key, default=None):
-    r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
-    return r[0] if r else default
-
-def db_set(key, value):
-    conn.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (key, str(value)))
-    conn.commit()
-
-def is_in_killzone():
-    now = datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() >= 5: return False
-    t = now.hour + now.minute / 60
-    return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
 # 🚀 XAUS API (السعر الفوري للذهب والفضة)
@@ -89,12 +49,9 @@ async def get_live_prices():
             
             if status == 'fresh':
                 return round(gold_price, 2), round(silver_price, 2)
-            else:
-                logging.warning("XAUS data is stale.")
     except Exception as e:
         logging.warning(f"XAUS failed: {e}")
 
-    # Fallback to yfinance
     try:
         gold = yf.Ticker("GC=F").history(period="1d", interval="1m")
         silver = yf.Ticker("SI=F").history(period="1d", interval="1m")
@@ -288,7 +245,7 @@ def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     return max(0.01, round(lot_size, 2))
 
 # ==========================================
-# 🧠 مجلس العباقرة
+# 🧠 مجلس العباقرة (باستخدام freellmpool)
 # ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
@@ -305,24 +262,16 @@ async def ask_ai_council(data_summary):
     😈 محامي الشيطان: [جملة واحدة]
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة واحدة]
     """
-    if ai_enabled:
-        try:
-            response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
-            return response.text
-        except: pass
-    if GROQ_API_KEY:
-        try:
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
-            response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
-            return response.choices[0].message.content
-        except: pass
-    if OPENROUTER_API_KEY:
-        try:
-            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-            response = client.chat.completions.create(model="meta-llama/llama-3.3-70b-instruct:free", messages=[{"role": "user", "content": prompt}])
-            return response.choices[0].message.content
-        except: pass
-    return "⚠️ AI غير متاح دابا."
+    
+    try:
+        # ✅ استخدام AsyncPool مع التبديل التلقائي بين 16 مزودًا
+        async with AsyncPool.from_default_config() as pool:
+            reply = await pool.aask(prompt)
+            logging.info(f"AI served by: {reply.provider_id}/{reply.model}")
+            return reply.text
+    except Exception as e:
+        logging.error(f"freellmpool failed: {e}")
+        return "⚠️ جميع مزودي الذكاء الاصطناعي مشغولين دابا."
 
 # ==========================================
 # 🚀 المحرك الرئيسي
@@ -332,7 +281,6 @@ async def run_engine():
         macro_bias, macro_msg = await get_macro_bias()
         news_danger, news_msg = is_news_dangerous()
         
-        # جلب البيانات التاريخية
         df_d1 = await fetch_data("GC=F", "1y", "1d"); await asyncio.sleep(1)
         df_h4 = await fetch_data("GC=F", "3mo", "4h"); await asyncio.sleep(1)
         df_h1 = await fetch_data("GC=F", "1mo", "1h"); await asyncio.sleep(1)
@@ -341,7 +289,6 @@ async def run_engine():
         if any(d is None for d in [df_d1, df_h4, df_h1, df_m15]):
             return None, "❌ تعذر جلب بيانات."
 
-        # جلب السعر الفوري والفضة من XAUS
         current_price, silver_price = await get_live_prices()
         if current_price is None:
             current_price = df_m15['Close'].iloc[-1]
@@ -396,7 +343,6 @@ async def run_engine():
             )
             return {"type": "REPORT", "msg": report}, None
 
-        # فلاتر إضافية
         if vol_div and signal_dir == 1:
             return {"type": "REPORT", "msg": f"🚫 *فلتر Volume Divergence:* {vol_div_msg}. لا يُنصح بالشراء."}, None
         if signal_dir == 1 and ha_trend == "BEARISH":
@@ -424,7 +370,7 @@ async def run_engine():
         lot_size = calculate_position_size(1000.0, entry, sl)
 
         signal_report = (
-            f"👑 *إشارة الوحش 38.0*\n"
+            f"👑 *إشارة الوحش 40.0*\n"
             f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{trade_type}\n"
@@ -461,5 +407,33 @@ async def main():
             db_set("last_report_time", current_time)
         await send_telegram_msg(msg)
 
+# ==========================================
+# 🗄️ قاعدة البيانات (دوال مساعدة)
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.executescript("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);")
+    conn.commit()
+    return conn
+
+conn = init_db()
+
+def db_get(key, default=None):
+    r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+def db_set(key, value):
+    conn.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (key, str(value)))
+    conn.commit()
+
+def is_in_killzone():
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5: return False
+    t = now.hour + now.minute / 60
+    return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
+
+# ==========================================
+# 🚀 التشغيل
+# ==========================================
 if __name__ == '__main__':
     asyncio.run(main())
