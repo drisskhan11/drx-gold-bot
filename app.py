@@ -31,7 +31,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 DB_FILE = "quantum_beast_40.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
-CONFLUENCE_THRESHOLD = 70 # الحد الأدنى للنقاط باش تصيفط الإشارة
+CONFLUENCE_THRESHOLD = 70
 
 try:
     from google import genai
@@ -134,7 +134,6 @@ def strict_news_blackout():
             news_time = pd.to_datetime(date_str).tz_localize(None).replace(tzinfo=ZoneInfo("America/New_York"))
             title = news.get('title', '')
             
-            # حظر من 30 دقيقة قبل لـ 45 دقيقة بعد الخبر
             diff_minutes = (news_time - now_ny).total_seconds() / 60
             
             if -45 <= diff_minutes <= 30 and any(k in title for k in critical):
@@ -142,6 +141,24 @@ def strict_news_blackout():
                 
         return False, "آمن"
     except: return False, "تعذر جلب الأخبار"
+
+# ==========================================
+# 📊 تحليل التباعد (Volume Divergence) - الدالة اللي كانت ناقصة
+# ==========================================
+def detect_volume_divergence(df, label):
+    if df is None or len(df) < 20:
+        return False, "بيانات غير كافية"
+    try:
+        recent = df.tail(10)
+        price_trend = recent['Close'].iloc[-1] - recent['Close'].iloc[0]
+        volume_trend = recent['Volume'].iloc[-1] - recent['Volume'].iloc[0]
+        
+        if price_trend > 0 and volume_trend < 0:
+            return True, f"⚠️ {label}: تباعد هبوطي"
+        elif price_trend < 0 and volume_trend > 0:
+            return True, f"⚠️ {label}: تباعد صعودي"
+        return False, f"✅ {label}: لا يوجد تباعد"
+    except: return False, "خطأ"
 
 # ==========================================
 # 🧠 المؤشرات والعلوم المخفية
@@ -189,23 +206,6 @@ def pca_analysis(df):
         return round(pca.explained_variance_ratio_[0] * 100, 2)
     except: return None
 
-def market_maker_simulation(df):
-    try:
-        if df is None or len(df) < 20: return None, None
-        high = df['High'].tail(20).max()
-        low = df['Low'].tail(20).min()
-        return round(high + (high - low) * 0.2, 2), round(low - (high - low) * 0.2, 2)
-    except: return None, None
-
-def calculate_heatmap(df):
-    if df is None or len(df) < 30: return None, []
-    try:
-        hist, bin_edges = np.histogram(df['Close'].values, bins=50, weights=df['Volume'].values)
-        poc_idx = np.argmax(hist)
-        poc = (bin_edges[poc_idx] + bin_edges[poc_idx+1]) / 2
-        return round(float(poc), 2), []
-    except: return None, []
-
 async def get_macro_bias():
     try:
         dxy = await fetch_data("DX-Y.NYB", "5d", "1h")
@@ -236,54 +236,49 @@ def calculate_confluence_score(h4_dir, h1_dir, m15_dir, macro_bias, hurst, stoch
     score = 0
     details = []
     
-    # 1. SMC Alignment (30 نقطة)
     if h4_dir == 1 and h1_dir == 1 and m15_dir == 1:
         score += 30
-        details.append("SMC: +30 (توافق كامل صعود)")
+        details.append("SMC: +30 (توافق صعود)")
     elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1:
         score += 30
-        details.append("SMC: +30 (توافق كامل هبوط)")
+        details.append("SMC: +30 (توافق هبوط)")
     elif h4_dir == 1 and h1_dir == 1:
         score += 15
         details.append("SMC: +15 (توافق جزئي)")
     else:
         details.append("SMC: +0 (تضارب)")
     
-    # 2. Macro (20 نقطة)
     if (h4_dir == 1 and macro_bias == "BULLISH_GOLD") or (h4_dir == -1 and macro_bias == "BEARISH_GOLD"):
         score += 20
         details.append("Macro: +20 (متوافق)")
     else:
         details.append("Macro: +0 (غير متوافق)")
     
-    # 3. Hurst (20 نقطة)
     if hurst > 0.55:
         score += 20
-        details.append(f"Hurst: +20 (ترند قوي: {hurst})")
+        details.append(f"Hurst: +20 ({hurst})")
     elif hurst < 0.45:
         score += 10
-        details.append(f"Hurst: +10 (تذبذب: {hurst})")
+        details.append(f"Hurst: +10 ({hurst})")
     else:
-        details.append(f"Hurst: +0 (محايد: {hurst})")
+        details.append(f"Hurst: +0 ({hurst})")
     
-    # 4. Momentum (15 نقطة)
     if (h4_dir == 1 and stoch_rsi < 40) or (h4_dir == -1 and stoch_rsi > 60):
         score += 15
-        details.append(f"Momentum: +15 (مناسب: {stoch_rsi:.1f})")
+        details.append(f"Momentum: +15 ({stoch_rsi:.1f})")
     else:
-        details.append(f"Momentum: +0 (غير مناسب: {stoch_rsi:.1f})")
+        details.append(f"Momentum: +0 ({stoch_rsi:.1f})")
     
-    # 5. Volume (15 نقطة)
     if not vol_divergence:
         score += 15
-        details.append("Volume: +15 (بدون تباعد)")
+        details.append("Volume: +15")
     else:
         details.append("Volume: +0 (تباعد)")
     
     return score, details
 
 # ==========================================
-# 🧠 إدارة حجم المركز (Kelly)
+# 🧠 إدارة حجم المركز
 # ==========================================
 def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     risk_per_unit = abs(entry - sl)
@@ -297,7 +292,7 @@ def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     return max(0.01, round(lot_size, 2))
 
 # ==========================================
-# 🧠 مجلس العباقرة الموسع (4 مزودين AI)
+# 🧠 مجلس العباقرة
 # ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
@@ -350,7 +345,6 @@ async def ask_ai_council(data_summary):
 # ==========================================
 async def run_engine():
     try:
-        # 1. فحص الأخبار (Strict News Blackout)
         news_blocked, news_msg = strict_news_blackout()
         if news_blocked:
             return {"type": "NEWS_BLACKOUT", "msg": f"🚨 *حظر أخبار صارم:*\n{news_msg}\n⏸️ البوت مامنعش أي تداول دابا."}, None
@@ -378,12 +372,10 @@ async def run_engine():
         stoch_rsi_val = calculate_stoch_rsi(df_m15)
         vol_div, vol_div_msg = detect_volume_divergence(df_h1, "H1")
         
-        # 2. حساب النقاط (Confluence Score)
         score, score_details = calculate_confluence_score(h4_dir, h1_dir, m15_dir, macro_bias, hurst, stoch_rsi_val, vol_div)
         
         score_status = "🟢 ممتاز" if score >= 80 else "🟡 جيد" if score >= 70 else "🔴 ضعيف"
 
-        # 3. بناء التقرير
         report = (
             f"👑 *الوحش 40.0 (Confluence + AI Council)*\n"
             f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
@@ -401,14 +393,12 @@ async def run_engine():
             f"━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-        # 4. إلا كانت النقاط عالية، نسولو الذكاء الاصطناعي
         if score >= CONFLUENCE_THRESHOLD:
             ai_summary = f"السعر: {current_price}\nSMC: H4={h4_dir}, H1={h1_dir}, M15={m15_dir}\nMacro: {macro_msg}\nHurst: {hurst}\nStoch RSI: {stoch_rsi_val:.1f}\nVolume Divergence: {vol_div_msg}\nConfluence Score: {score}/100"
             ai_verdict = await ask_ai_council(ai_summary)
             report += f"🧠 *مجلس العباقرة:*\n{ai_verdict}\n"
             
-            if "انتظار" not in ai_verdict and "شراء" in ai_verdict or "بيع" in ai_verdict:
-                # إشارة كاملة
+            if "انتظار" not in ai_verdict and ("شراء" in ai_verdict or "بيع" in ai_verdict):
                 atr_m15 = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
                 entry = round(current_price, 2)
                 if "شراء" in ai_verdict:
