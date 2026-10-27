@@ -10,18 +10,17 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.decomposition import PCA
 import telegram
 from openai import OpenAI
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.decomposition import PCA
 
-# ✅ الاستيراد الصحيح للمكتبات الجديدة
+# ✅ الاستيراد الصحيح
 try:
     from flashalpha import FlashAlpha
     from tickerlayer import TickerLayer
     new_libs_enabled = True
-except ImportError as e:
-    logging.warning(f"New libraries not found: {e}")
+except ImportError:
     new_libs_enabled = False
 
 warnings.filterwarnings("ignore")
@@ -35,7 +34,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-
 TICKERLAYER_API_KEY = os.environ.get("TICKERLAYER_API_KEY", "").strip()
 FLASHALPHA_API_KEY = os.environ.get("FLASHALPHA_API_KEY", "").strip()
 
@@ -48,11 +46,10 @@ try:
     ai_client = genai.Client(api_key=GEMINI_API_KEY)
     AI_MODEL = "gemini-3.5-flash-lite"
     ai_enabled = True
-except Exception as e:
-    logging.error(f"AI Error: {e}")
+except Exception:
     ai_enabled = False
 
-# ✅ تهيئة عملاء البيانات الجدد بحماية
+# ✅ تهيئة العملاء
 tl_client = None
 fa_client = None
 if new_libs_enabled:
@@ -62,14 +59,14 @@ if new_libs_enabled:
         fa_client = FlashAlpha(FLASHALPHA_API_KEY)
 
 # ==========================================
-# 📱 دالة إرسال رسالة لتيليجرام
+# 📱 إرسال تيليجرام
 # ==========================================
 async def send_telegram_msg(text):
     try:
         bot = telegram.Bot(token=TOKEN)
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
     except Exception as e:
-        logging.error(f"Telegram Send Error: {e}")
+        logging.error(f"Telegram Error: {e}")
 
 # ==========================================
 # 🗄️ قاعدة البيانات
@@ -103,22 +100,25 @@ async def get_live_price():
     if not tl_client: return None
     try:
         quote = tl_client.quote("commodities", "XAUUSD")
-        return quote.get('bid') or quote.get('ask') or quote.get('last_price')
+        return quote.get('bid') or quote.get('last_price')
     except Exception as e:
         logging.warning(f"TickerLayer failed: {e}")
         return None
 
 # ==========================================
-# 🔮 تحليل الجاما (FlashAlpha)
+# 🔮 تحليل الجاما (FlashAlpha) - التصحيح
 # ==========================================
 async def get_gamma_analysis():
-    if not fa_client: return None, None, None, None
+    if not fa_client: 
+        logging.warning("FlashAlpha client not initialized.")
+        return None, None, None, None
     try:
-        gex = fa_client.gex("GLD")
+        # ✅ نستعملو SPY حيت عندو سيولة كبيرة في الخيارات
+        gex = fa_client.gex("SPY")
         net_gex = gex.get('net_gex')
-        gamma_flip = gex.get('gamma_flip')
+        gamma_flip = gex.get('gamma_flip') # يمكن يكون None
         
-        levels = fa_client.exposure_levels("GLD")
+        levels = fa_client.exposure_levels("SPY")
         call_wall = levels.get('levels', {}).get('call_wall')
         put_wall = levels.get('levels', {}).get('put_wall')
         
@@ -128,31 +128,19 @@ async def get_gamma_analysis():
         return None, None, None, None
 
 # ==========================================
-# 🌐 جلب البيانات (مع Fallback)
+# 🌐 جلب البيانات
 # ==========================================
 async def fetch_data(symbol, period, interval):
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval)
         if not df.empty: return df
-    except Exception:
-        pass
-
+    except: pass
     try:
-        fallback_symbol = "XAUUSD=X" if symbol == "GC=F" else symbol
-        ticker = yf.Ticker(fallback_symbol)
+        ticker = yf.Ticker("XAUUSD=X" if symbol == "GC=F" else symbol)
         df = ticker.history(period=period, interval=interval)
         if not df.empty: return df
-    except Exception:
-        pass
-
-    if symbol == "GC=F":
-        try:
-            ticker = yf.Ticker("GLD")
-            df = ticker.history(period=period, interval=interval)
-            if not df.empty: return df
-        except Exception:
-            pass
+    except: pass
     return None
 
 # ==========================================
@@ -165,16 +153,14 @@ def calculate_hurst_exponent(price_series, max_lag=20):
         tau = [np.sqrt(np.std(np.subtract(price_series[lag:], price_series[:-lag]))) for lag in lags]
         poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
         return round(poly[0] * 2.0, 2)
-    except Exception:
-        return 0.5
+    except: return 0.5
 
 def calculate_adr(df_d1):
     try:
         if df_d1 is None or len(df_d1) < 14: return 0
         df_d1['Range'] = df_d1['High'] - df_d1['Low']
         return round(df_d1['Range'].rolling(14).mean().iloc[-1], 2)
-    except Exception:
-        return 0
+    except: return 0
 
 def get_golden_pocket(df):
     try:
@@ -185,11 +171,10 @@ def get_golden_pocket(df):
         fib_618 = recent_high - (diff * 0.618)
         fib_65 = recent_high - (diff * 0.65)
         return round(min(fib_618, fib_65), 2), round(max(fib_618, fib_65), 2)
-    except Exception:
-        return None, None
+    except: return None, None
 
 # ==========================================
-# 🧠 SMC و المؤشرات
+# 🧠 SMC والمؤشرات
 # ==========================================
 def analyze_smc(df, label):
     if df is None or len(df) < 50: return 0, None, f"{label}: بيانات غير كافية"
@@ -209,8 +194,7 @@ def analyze_smc(df, label):
         elif abs(current_price - ob_bear) < atr * 2:
             return -1, {'top': ob_bear}, f"{label}: 🔴 Bearish OB"
         return 0, None, f"{label}: محايد"
-    except Exception:
-        return 0, None, f"{label}: خطأ"
+    except: return 0, None, f"{label}: خطأ"
 
 def pca_analysis(df):
     try:
@@ -219,8 +203,7 @@ def pca_analysis(df):
         pca = PCA(n_components=1)
         pca.fit(features)
         return round(pca.explained_variance_ratio_[0] * 100, 2)
-    except Exception:
-        return None
+    except: return None
 
 def market_maker_simulation(df):
     try:
@@ -228,15 +211,13 @@ def market_maker_simulation(df):
         high = df['High'].tail(20).max()
         low = df['Low'].tail(20).min()
         return round(high + (high - low) * 0.2, 2), round(low - (high - low) * 0.2, 2)
-    except Exception:
-        return None, None
+    except: return None, None
 
 def calculate_correlation(gold_df, dxy_df):
     try:
         if gold_df is None or dxy_df is None or len(gold_df) < 50: return 0.0
         return round(gold_df['Close'].tail(50).reset_index(drop=True).corr(dxy_df['Close'].tail(50).reset_index(drop=True)), 2)
-    except Exception:
-        return 0.0
+    except: return 0.0
 
 def ai_predict_price(df):
     try:
@@ -251,8 +232,7 @@ def ai_predict_price(df):
         model = RandomForestRegressor(n_estimators=50, random_state=42)
         model.fit(X[:split], y[:split])
         return round(model.predict(X[-1].reshape(1, -1))[0], 2)
-    except Exception:
-        return None
+    except: return None
 
 def calculate_heatmap(df):
     if df is None or len(df) < 30: return None, []
@@ -263,8 +243,7 @@ def calculate_heatmap(df):
         threshold = np.percentile(hist, 90)
         hot_zones = [(bin_edges[i] + bin_edges[i+1]) / 2 for i in range(len(hist)) if hist[i] >= threshold]
         return round(float(poc), 2), [round(float(z), 2) for z in hot_zones]
-    except Exception:
-        return None, []
+    except: return None, []
 
 async def get_macro_bias():
     try:
@@ -276,8 +255,7 @@ async def get_macro_bias():
         if dxy_bull and us10y_bull: return "BEARISH_GOLD", "💵 الدولار صاعد"
         elif not dxy_bull and not us10y_bull: return "BULLISH_GOLD", "✨ الدولار هابط"
         else: return "NEUTRAL", "⚖️ تضارب"
-    except Exception:
-        return "NEUTRAL", "تعذر"
+    except: return "NEUTRAL", "تعذر"
 
 def is_news_dangerous():
     try:
@@ -294,11 +272,10 @@ def is_news_dangerous():
             if news_time.date() == now_ny.date() and any(k in title for k in critical):
                 return True, f"حدث مفصلي: {title}"
         return False, "آمن"
-    except Exception:
-        return False, "تعذر جلب الأخبار"
+    except: return False, "تعذر جلب الأخبار"
 
 # ==========================================
-# 🧠 إدارة حجم المركز (Kelly)
+# 🧠 إدارة حجم المركز
 # ==========================================
 def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     risk_per_unit = abs(entry - sl)
@@ -312,7 +289,7 @@ def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     return max(0.01, round(lot_size, 2))
 
 # ==========================================
-# 🧠 مجلس العباقرة (Multi-AI)
+# 🧠 مجلس العباقرة
 # ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
@@ -391,7 +368,7 @@ async def run_engine():
         if h4_dir == 1 and h1_dir == 1 and m15_dir == 1 and repricing_gate: signal_dir = 1
         elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1 and repricing_gate: signal_dir = -1
 
-        gamma_status = f"GEX={net_gex}" if net_gex else "غير متاح"
+        gamma_status = f"GEX={net_gex if net_gex else 'غير متاح'}"
 
         if signal_dir == 0:
             report = (
@@ -451,23 +428,18 @@ async def run_engine():
 
 async def main():
     payload, err = await run_engine()
-    
     if err:
         await send_telegram_msg(f"⚠️ *خطأ:*\n{err}")
         return
-
     if payload:
         msg = payload["msg"]
         msg_type = payload["type"]
-
         if msg_type == "REPORT":
             last_report = db_get("last_report_time")
             current_time = datetime.now().strftime("%Y-%m-%d %H")
             if last_report == current_time:
-                logging.info("Report already sent this hour.")
                 return
             db_set("last_report_time", current_time)
-            
         await send_telegram_msg(msg)
 
 if __name__ == '__main__':
