@@ -478,5 +478,5 @@ async def main():
         
     if payload:
         msg = payload["msg"]
-        # ✅ حيدنا فلتر الساعة، دابا كيصيفط فكل مرة كيصحي
- 
+        print("📤 Sending message to Telegram...")
+       
