@@ -6,3 +6,5 @@ requests
 google-genai
 scikit-learn
 openai
+tickerlayer
+flashalpha
