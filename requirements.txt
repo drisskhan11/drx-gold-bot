@@ -6,5 +6,4 @@ requests
 google-genai
 scikit-learn
 openai
-flashalpha
-eulerpool
+freellmpool
