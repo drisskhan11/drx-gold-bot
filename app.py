@@ -15,11 +15,13 @@ from openai import OpenAI
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
 
-# ✅ مكتبة TickerLayer فقط (حيدنا FlashAlpha حيت غادي نستعملو requests مباشرة)
+# ✅ استيراد المكتبات الجديدة (بدون TickerLayer)
 try:
-    from tickerlayer import TickerLayer
+    from flashalpha import FlashAlpha
+    import eulerpool
     new_libs_enabled = True
-except ImportError:
+except ImportError as e:
+    logging.warning(f"New libraries not found: {e}")
     new_libs_enabled = False
 
 warnings.filterwarnings("ignore")
@@ -33,10 +35,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-TICKERLAYER_API_KEY = os.environ.get("TICKERLAYER_API_KEY", "").strip()
 FLASHALPHA_API_KEY = os.environ.get("FLASHALPHA_API_KEY", "").strip()
+EULERPOOL_API_KEY = os.environ.get("EULERPOOL_API_KEY", "").strip()
 
-DB_FILE = "quantum_beast_31.db"
+DB_FILE = "quantum_beast_34.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
 
@@ -48,10 +50,12 @@ try:
 except Exception:
     ai_enabled = False
 
-# ✅ تهيئة TickerLayer
-tl_client = None
-if new_libs_enabled and TICKERLAYER_API_KEY:
-    tl_client = TickerLayer(TICKERLAYER_API_KEY)
+# ✅ تهيئة العملاء
+fa_client = None
+eu_client = None
+if new_libs_enabled:
+    if FLASHALPHA_API_KEY: fa_client = FlashAlpha(FLASHALPHA_API_KEY)
+    if EULERPOOL_API_KEY: eu_client = eulerpool.Client(EULERPOOL_API_KEY)
 
 # ==========================================
 # 📱 إرسال تيليجرام
@@ -89,42 +93,40 @@ def is_in_killzone():
     return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
-# ⚡ السعر الفوري (TickerLayer)
-# ==========================================
-async def get_live_price():
-    if not tl_client: return None
-    try:
-        quote = tl_client.quote("commodities", "XAUUSD")
-        return quote.get('bid') or quote.get('last_price')
-    except Exception as e:
-        logging.warning(f"TickerLayer failed: {e}")
-        return None
-
-# ==========================================
-# 🔮 تحليل الجاما (FlashAlpha) - النسخة التشخيصية
+# 🔮 تحليل الجاما (FlashAlpha) - بالطريقة الرسمية
 # ==========================================
 async def get_gamma_analysis():
-    if not FLASHALPHA_API_KEY:
-        return "مفتاح ناقص فـ GitHub Secrets", None, None, None
+    if not fa_client: return "مفتاح ناقص", None, None, None
     try:
-        headers = {"X-Api-Key": FLASHALPHA_API_KEY}
-        # نستعملو requests مباشرة باش نشوفو كود الخطأ
-        r = requests.get("https://lab.flashalpha.com/v1/gex?symbol=SPY", headers=headers, timeout=10)
+        gex = fa_client.gex("SPY")
+        net_gex = gex.get('net_gex')
+        gamma_flip = gex.get('gamma_flip')
+        status = gex.get('gamma_flip_status', 'unknown')
         
-        if r.status_code == 200:
-            data = r.json()
-            net_gex = data.get('net_gex')
-            if net_gex is None:
-                return "البيانات فارغة (None)", None, None, None
-            return str(net_gex), None, None, None
-        else:
-            # هادي هي اللي غادي تقولينا فين المشكل بالضبط (مثلاً HTTP 403)
-            return f"خطأ HTTP {r.status_code}", None, None, None
+        gex_str = f"{net_gex:,.0f}" if net_gex is not None else "غير متاح"
+        flip_str = f"{gamma_flip:.2f}" if gamma_flip is not None and status == "available" else "غير محدد"
+        
+        return f"GEX={gex_str} | Flip={flip_str}", None, None, None
     except Exception as e:
-        return f"خطأ تقني: {str(e)[:20]}", None, None, None
+        logging.warning(f"FlashAlpha failed: {e}")
+        return f"خطأ: {str(e)[:20]}", None, None, None
 
 # ==========================================
-# 🌐 جلب البيانات
+# 💰 تدفقات GLD (eulerpool)
+# ==========================================
+async def get_gld_flows():
+    if not eu_client: return "مفتاح ناقص"
+    try:
+        flows = eu_client.etf.flows("GLD")
+        if flows and 'net_flow' in flows:
+            return f"${flows['net_flow']:,.0f}"
+        return "غير متاح"
+    except Exception as e:
+        logging.warning(f"Eulerpool GLD flows failed: {e}")
+        return "خطأ فالاتصال"
+
+# ==========================================
+# 🌐 جلب البيانات (yfinance فقط)
 # ==========================================
 async def fetch_data(symbol, period, interval):
     try:
@@ -140,7 +142,7 @@ async def fetch_data(symbol, period, interval):
     return None
 
 # ==========================================
-# 🧠 العلوم المخفية
+# 🧠 العلوم المخفية (Hurst, ADR, SMC, ...)
 # ==========================================
 def calculate_hurst_exponent(price_series, max_lag=20):
     try:
@@ -158,20 +160,6 @@ def calculate_adr(df_d1):
         return round(df_d1['Range'].rolling(14).mean().iloc[-1], 2)
     except: return 0
 
-def get_golden_pocket(df):
-    try:
-        if df is None or len(df) < 20: return None, None
-        recent_high = df['High'].tail(20).max()
-        recent_low = df['Low'].tail(20).min()
-        diff = recent_high - recent_low
-        fib_618 = recent_high - (diff * 0.618)
-        fib_65 = recent_high - (diff * 0.65)
-        return round(min(fib_618, fib_65), 2), round(max(fib_618, fib_65), 2)
-    except: return None, None
-
-# ==========================================
-# 🧠 SMC والمؤشرات
-# ==========================================
 def analyze_smc(df, label):
     if df is None or len(df) < 50: return 0, None, f"{label}: بيانات غير كافية"
     try:
@@ -270,9 +258,6 @@ def is_news_dangerous():
         return False, "آمن"
     except: return False, "تعذر جلب الأخبار"
 
-# ==========================================
-# 🧠 إدارة حجم المركز (Kelly)
-# ==========================================
 def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     risk_per_unit = abs(entry - sl)
     if risk_per_unit == 0: return 0.01
@@ -284,9 +269,6 @@ def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     lot_size = risk_amount / (risk_per_unit * 100)
     return max(0.01, round(lot_size, 2))
 
-# ==========================================
-# 🧠 مجلس العباقرة
-# ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
     أنت مجلس خبراء تداول (Multi-Agent System) مكون من 3 أعضاء.
@@ -321,9 +303,6 @@ async def ask_ai_council(data_summary):
         except: pass
     return "⚠️ AI غير متاح دابا."
 
-# ==========================================
-# 🚀 المحرك الرئيسي
-# ==========================================
 async def run_engine():
     try:
         macro_bias, macro_msg = await get_macro_bias()
@@ -337,10 +316,9 @@ async def run_engine():
         if any(d is None for d in [df_d1, df_h4, df_h1, df_m15]):
             return None, "❌ تعذر جلب بيانات."
 
-        live_price = await get_live_price()
-        current_price = live_price if live_price else df_m15['Close'].iloc[-1]
+        current_price = df_m15['Close'].iloc[-1]
 
-        h4_dir, h4_ob, h4_msg = analyze_smc(df_h4, "H4")
+        h4_dir, _, h4_msg = analyze_smc(df_h4, "H4")
         h1_dir, h1_ob, h1_msg = analyze_smc(df_h1, "H1")
         m15_dir, m15_ob, m15_msg = analyze_smc(df_m15, "M15")
         
@@ -348,9 +326,8 @@ async def run_engine():
         adr = calculate_adr(df_d1)
         poc, hot_zones = calculate_heatmap(df_h1)
         hidden_above, hidden_below = market_maker_simulation(df_h1)
-
-        # ✅ التعديل التشخيصي للجاما
         gamma_status, _, _, _ = await get_gamma_analysis()
+        gld_flow = await get_gld_flows()
 
         if news_danger:
             return {"type": "NEWS", "msg": f"🚨 *تحذير أخبار:* {news_msg}"}, None
@@ -377,13 +354,21 @@ async def run_engine():
                 f"📏 متوسط الحركة (ADR): {adr}\n"
                 f"🔥 سيولة: فوق {hidden_above} | تحت {hidden_below}\n"
                 f"🔮 الجاما: {gamma_status}\n"
+                f"💰 تدفقات GLD: {gld_flow}\n"
                 f"📊 SMC: {smc_status}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🧐 *الوضع:* لا يوجد توافق فالفريمات دابا."
             )
             return {"type": "REPORT", "msg": report}, None
 
-        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nسيولة: {hidden_above}/{hidden_below}\nGamma: {gamma_status}"
+        if gld_flow and "خطأ" not in gld_flow and "ناقص" not in gld_flow:
+            try:
+                flow_val = float(gld_flow.replace('$', '').replace(',', '').replace(' ', ''))
+                if signal_dir == 1 and flow_val < -50:
+                    return {"type": "REPORT", "msg": f"🚫 *فلتر GLD:* تدفقات سلبية بقوة ({gld_flow}). لا يُنصح بالشراء."}, None
+            except: pass
+
+        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nسيولة: {hidden_above}/{hidden_below}\nGamma: {gamma_status}\nGLD Flows: {gld_flow}"
         ai_verdict = await ask_ai_council(ai_summary)
         
         if "انتظار" in ai_verdict:
@@ -403,7 +388,7 @@ async def run_engine():
         lot_size = calculate_position_size(1000.0, entry, sl)
 
         signal_report = (
-            f"👑 *إشارة الوحش 31.1*\n"
+            f"👑 *إشارة الوحش 34.0*\n"
             f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{trade_type}\n"
@@ -413,6 +398,7 @@ async def run_engine():
             f"📦 *حجم المركز:* `{lot_size}` لوت\n"
             f"📊 SMC: {smc_status}\n"
             f"🔮 الجاما: {gamma_status}\n"
+            f"💰 تدفقات GLD: {gld_flow}\n"
             f"💵 الماكرو: {macro_msg}\n"
             f"🧠 *AI:* {ai_verdict}"
         )
