@@ -27,7 +27,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-DB_FILE = "quantum_beast_36.db"
+DB_FILE = "quantum_beast_38.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
 
@@ -75,7 +75,39 @@ def is_in_killzone():
     return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
-# 🌐 جلب البيانات (yfinance فقط)
+# 🚀 XAUS API (السعر الفوري للذهب والفضة)
+# ==========================================
+async def get_live_prices():
+    try:
+        url = "https://xaus.com/api/v1/spot?compact=1"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            gold_price = data.get('spot_usd_oz')
+            silver_price = data.get('silver_usd_oz')
+            status = data.get('data_state', {}).get('status')
+            
+            if status == 'fresh':
+                return round(gold_price, 2), round(silver_price, 2)
+            else:
+                logging.warning("XAUS data is stale.")
+    except Exception as e:
+        logging.warning(f"XAUS failed: {e}")
+
+    # Fallback to yfinance
+    try:
+        gold = yf.Ticker("GC=F").history(period="1d", interval="1m")
+        silver = yf.Ticker("SI=F").history(period="1d", interval="1m")
+        if not gold.empty:
+            g_price = gold['Close'].iloc[-1]
+            s_price = silver['Close'].iloc[-1] if not silver.empty else None
+            return round(g_price, 2), round(s_price, 2) if s_price else None
+    except:
+        pass
+    return None, None
+
+# ==========================================
+# 🌐 جلب البيانات التاريخية (yfinance)
 # ==========================================
 async def fetch_data(symbol, period, interval):
     try:
@@ -91,68 +123,34 @@ async def fetch_data(symbol, period, interval):
     return None
 
 # ==========================================
-# 🌪️ تحليل VIX (مؤشر الخوف)
-# ==========================================
-async def get_vix_analysis():
-    try:
-        vix_data = await fetch_data("^VIX", "5d", "1h")
-        if vix_data is None or len(vix_data) < 20:
-            return "NEUTRAL", "بيانات غير كافية"
-        
-        current_vix = vix_data['Close'].iloc[-1]
-        vix_ema = vix_data['Close'].ewm(span=20).mean().iloc[-1]
-        
-        if current_vix > 25 and current_vix > vix_ema:
-            return "HIGH_FEAR", f"خوف عالي ({current_vix:.1f}) - دعم للذهب"
-        elif current_vix < 15 and current_vix < vix_ema:
-            return "LOW_FEAR", f"خوف منخفض ({current_vix:.1f}) - ضغط على الذهب"
-        else:
-            return "NEUTRAL", f"طبيعي ({current_vix:.1f})"
-    except Exception as e:
-        logging.warning(f"VIX analysis failed: {e}")
-        return "NEUTRAL", "خطأ"
-
-# ==========================================
-# 📊 كشف التباعد بين السعر والفوليوم
+# 📊 تحليل التباعد (Volume Divergence)
 # ==========================================
 def detect_volume_divergence(df, label):
     if df is None or len(df) < 20:
         return False, "بيانات غير كافية"
-    
     try:
         recent = df.tail(10)
         price_trend = recent['Close'].iloc[-1] - recent['Close'].iloc[0]
         volume_trend = recent['Volume'].iloc[-1] - recent['Volume'].iloc[0]
         
-        # تباعد هبوطي: السعر طالع، الفوليوم هابط
         if price_trend > 0 and volume_trend < 0:
-            return True, f"⚠️ {label}: تباعد هبوطي (السعر طالع، الفوليوم هابط)"
-        
-        # تباعد صعودي: السعر هابط، الفوليوم طالع
+            return True, f"⚠️ {label}: تباعد هبوطي"
         elif price_trend < 0 and volume_trend > 0:
-            return True, f"⚠️ {label}: تباعد صعودي (السعر هابط، الفوليوم طالع)"
-        
+            return True, f"⚠️ {label}: تباعد صعودي"
         return False, f"✅ {label}: لا يوجد تباعد"
-    except Exception as e:
-        return False, f"خطأ: {e}"
+    except: return False, "خطأ"
 
 # ==========================================
-# 🕯️ مؤشر Heikin-Ashi (لتصفية الضوضاء)
+# 🕯️ Heikin-Ashi و Stochastic RSI
 # ==========================================
 def calculate_heikin_ashi(df):
     try:
         ha_df = df.copy()
         ha_df['HA_Close'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
         ha_df['HA_Open'] = (df['Open'].shift(1) + df['Close'].shift(1)) / 2
-        ha_df['HA_High'] = ha_df[['High', 'HA_Open', 'HA_Close']].max(axis=1)
-        ha_df['HA_Low'] = ha_df[['Low', 'HA_Open', 'HA_Close']].min(axis=1)
         return ha_df
-    except:
-        return df
+    except: return df
 
-# ==========================================
-# 📉 مؤشر Stochastic RSI (للعلوم الكمومية)
-# ==========================================
 def calculate_stoch_rsi(df, period=14):
     try:
         delta = df['Close'].diff()
@@ -160,14 +158,12 @@ def calculate_stoch_rsi(df, period=14):
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
-        
         stoch_rsi = (rsi - rsi.rolling(period).min()) / (rsi.rolling(period).max() - rsi.rolling(period).min())
         return stoch_rsi.iloc[-1] * 100
-    except:
-        return 50.0
+    except: return 50.0
 
 # ==========================================
-# 🧠 العلوم المخفية (Hurst, ADR, SMC)
+# 🧠 العلوم المخفية (Hurst, ADR, SMC, PCA)
 # ==========================================
 def calculate_hurst_exponent(price_series, max_lag=20):
     try:
@@ -336,6 +332,7 @@ async def run_engine():
         macro_bias, macro_msg = await get_macro_bias()
         news_danger, news_msg = is_news_dangerous()
         
+        # جلب البيانات التاريخية
         df_d1 = await fetch_data("GC=F", "1y", "1d"); await asyncio.sleep(1)
         df_h4 = await fetch_data("GC=F", "3mo", "4h"); await asyncio.sleep(1)
         df_h1 = await fetch_data("GC=F", "1mo", "1h"); await asyncio.sleep(1)
@@ -344,7 +341,10 @@ async def run_engine():
         if any(d is None for d in [df_d1, df_h4, df_h1, df_m15]):
             return None, "❌ تعذر جلب بيانات."
 
-        current_price = df_m15['Close'].iloc[-1]
+        # جلب السعر الفوري والفضة من XAUS
+        current_price, silver_price = await get_live_prices()
+        if current_price is None:
+            current_price = df_m15['Close'].iloc[-1]
 
         h4_dir, _, h4_msg = analyze_smc(df_h4, "H4")
         h1_dir, h1_ob, h1_msg = analyze_smc(df_h1, "H1")
@@ -355,17 +355,9 @@ async def run_engine():
         poc, hot_zones = calculate_heatmap(df_h1)
         hidden_above, hidden_below = market_maker_simulation(df_h1)
         
-        # ✅ VIX
-        vix_status, vix_msg = await get_vix_analysis()
-        
-        # ✅ Volume Divergence
         vol_div, vol_div_msg = detect_volume_divergence(df_h1, "H1")
-        
-        # ✅ Heikin-Ashi
         ha_df = calculate_heikin_ashi(df_m15)
         ha_trend = "BULLISH" if ha_df['HA_Close'].iloc[-1] > ha_df['HA_Open'].iloc[-1] else "BEARISH"
-        
-        # ✅ Stochastic RSI
         stoch_rsi_val = calculate_stoch_rsi(df_m15)
 
         if news_danger:
@@ -381,15 +373,17 @@ async def run_engine():
         if h4_dir == 1 and h1_dir == 1 and m15_dir == 1 and repricing_gate: signal_dir = 1
         elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1 and repricing_gate: signal_dir = -1
 
+        silver_str = f"${silver_price:.2f}" if silver_price else "غير متاح"
+
         if signal_dir == 0:
             report = (
                 f"👀 *تقرير استخبارات السوق*\n"
                 f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 السعر: `{current_price:.2f}`\n"
+                f"💰 السعر الفوري: `{current_price:.2f}`\n"
+                f"🥈 الفضة: {silver_str}\n"
                 f"💵 الدولار: {macro_msg}\n"
                 f"📰 الأخبار: {news_msg}\n"
-                f"🌪️ VIX: {vix_msg}\n"
                 f"📊 Volume Divergence: {vol_div_msg}\n"
                 f"🕯️ Heikin-Ashi: {ha_trend}\n"
                 f"📉 Stochastic RSI: {stoch_rsi_val:.1f}\n"
@@ -402,21 +396,15 @@ async def run_engine():
             )
             return {"type": "REPORT", "msg": report}, None
 
-        # ✅ فلتر VIX
-        if signal_dir == 1 and vix_status == "LOW_FEAR":
-            return {"type": "REPORT", "msg": f"🚫 *فلتر VIX:* خوف منخفض ({vix_msg}). لا يُنصح بالشراء."}, None
-        
-        # ✅ فلتر Volume Divergence
+        # فلاتر إضافية
         if vol_div and signal_dir == 1:
             return {"type": "REPORT", "msg": f"🚫 *فلتر Volume Divergence:* {vol_div_msg}. لا يُنصح بالشراء."}, None
-        
-        # ✅ فلتر Heikin-Ashi
         if signal_dir == 1 and ha_trend == "BEARISH":
             return {"type": "REPORT", "msg": f"🚫 *فلتر Heikin-Ashi:* الاتجاه هابط. لا يُنصح بالشراء."}, None
         if signal_dir == -1 and ha_trend == "BULLISH":
             return {"type": "REPORT", "msg": f"🚫 *فلتر Heikin-Ashi:* الاتجاه صاعد. لا يُنصح بالبيع."}, None
 
-        ai_summary = f"السعر: {current_price}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nVIX: {vix_msg}\nVolume Divergence: {vol_div_msg}\nHeikin-Ashi: {ha_trend}\nStoch RSI: {stoch_rsi_val:.1f}"
+        ai_summary = f"السعر: {current_price}\nالفضة: {silver_str}\nSMC: {smc_status}\nالماكرو: {macro_msg}\nHurst: {hurst}\nVolume Divergence: {vol_div_msg}\nHeikin-Ashi: {ha_trend}\nStoch RSI: {stoch_rsi_val:.1f}"
         ai_verdict = await ask_ai_council(ai_summary)
         
         if "انتظار" in ai_verdict:
@@ -436,7 +424,7 @@ async def run_engine():
         lot_size = calculate_position_size(1000.0, entry, sl)
 
         signal_report = (
-            f"👑 *إشارة الوحش 36.0*\n"
+            f"👑 *إشارة الوحش 38.0*\n"
             f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{trade_type}\n"
@@ -445,7 +433,7 @@ async def run_engine():
             f"🏆 *الهدف:* `{tp1}`\n\n"
             f"📦 *حجم المركز:* `{lot_size}` لوت\n"
             f"📊 SMC: {smc_status}\n"
-            f"🌪️ VIX: {vix_msg}\n"
+            f"🥈 الفضة: {silver_str}\n"
             f"📊 Volume Divergence: {vol_div_msg}\n"
             f"🕯️ Heikin-Ashi: {ha_trend}\n"
             f"📉 Stochastic RSI: {stoch_rsi_val:.1f}\n"
