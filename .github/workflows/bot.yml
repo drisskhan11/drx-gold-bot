@@ -25,7 +25,7 @@ jobs:
     - name: Cache State Database
       uses: actions/cache@v4
       with:
-        path: quantum_beast_38.db
+        path: quantum_beast_40.db
         key: ${{ runner.os }}-quantum-beast-db-${{ github.run_id }}
         restore-keys: |
           ${{ runner.os }}-quantum-beast-db-
@@ -41,5 +41,6 @@ jobs:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: python app.py
