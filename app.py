@@ -11,11 +11,9 @@ import pandas as pd
 import numpy as np
 import requests
 import telegram
+from openai import OpenAI
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
-
-# ✅ استيراد المكتبة الثورية
-from freellmpool import AsyncPool
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -30,9 +28,52 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-DB_FILE = "quantum_beast_40.db"
+DB_FILE = "quantum_beast_39.db"
 KILLZONE_LONDON = (2.0, 5.0)
 KILLZONE_NY = (7.0, 11.0)
+
+try:
+    from google import genai
+    ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    AI_MODEL = "gemini-3.5-flash-lite"
+    ai_enabled = True
+except Exception:
+    ai_enabled = False
+
+# ==========================================
+# 📱 إرسال تيليجرام
+# ==========================================
+async def send_telegram_msg(text):
+    try:
+        bot = telegram.Bot(token=TOKEN)
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Telegram Error: {e}")
+
+# ==========================================
+# 🗄️ قاعدة البيانات
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.executescript("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);")
+    conn.commit()
+    return conn
+
+conn = init_db()
+
+def db_get(key, default=None):
+    r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+def db_set(key, value):
+    conn.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (key, str(value)))
+    conn.commit()
+
+def is_in_killzone():
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5: return False
+    t = now.hour + now.minute / 60
+    return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
 # 🚀 XAUS API (السعر الفوري للذهب والفضة)
@@ -52,6 +93,7 @@ async def get_live_prices():
     except Exception as e:
         logging.warning(f"XAUS failed: {e}")
 
+    # Fallback to yfinance
     try:
         gold = yf.Ticker("GC=F").history(period="1d", interval="1m")
         silver = yf.Ticker("SI=F").history(period="1d", interval="1m")
@@ -245,7 +287,7 @@ def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     return max(0.01, round(lot_size, 2))
 
 # ==========================================
-# 🧠 مجلس العباقرة (باستخدام freellmpool)
+# 🧠 مجلس العباقرة (4 مزودين AI)
 # ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
@@ -263,15 +305,46 @@ async def ask_ai_council(data_summary):
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة واحدة]
     """
     
-    try:
-        # ✅ استخدام AsyncPool مع التبديل التلقائي بين 16 مزودًا
-        async with AsyncPool.from_default_config() as pool:
-            reply = await pool.aask(prompt)
-            logging.info(f"AI served by: {reply.provider_id}/{reply.model}")
-            return reply.text
-    except Exception as e:
-        logging.error(f"freellmpool failed: {e}")
-        return "⚠️ جميع مزودي الذكاء الاصطناعي مشغولين دابا."
+    # 1. Gemini
+    if ai_enabled:
+        try:
+            logging.info("Trying Gemini...")
+            response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
+            return response.text
+        except Exception as e:
+            logging.warning(f"Gemini failed: {e}. Falling back to Groq.")
+
+    # 2. Groq
+    if GROQ_API_KEY:
+        try:
+            logging.info("Trying Groq...")
+            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.warning(f"Groq failed: {e}. Falling back to OpenRouter.")
+
+    # 3. OpenRouter
+    if OPENROUTER_API_KEY:
+        try:
+            logging.info("Trying OpenRouter...")
+            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+            response = client.chat.completions.create(model="meta-llama/llama-3.3-70b-instruct:free", messages=[{"role": "user", "content": prompt}])
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.warning(f"OpenRouter failed: {e}. Falling back to Mistral.")
+
+    # 4. Mistral
+    if MISTRAL_API_KEY:
+        try:
+            logging.info("Trying Mistral...")
+            client = OpenAI(base_url="https://api.mistral.ai/v1", api_key=MISTRAL_API_KEY)
+            response = client.chat.completions.create(model="mistral-small-latest", messages=[{"role": "user", "content": prompt}])
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"Mistral failed: {e}.")
+
+    return "⚠️ جميع مزودي الذكاء الاصطناعي مشغولين دابا."
 
 # ==========================================
 # 🚀 المحرك الرئيسي
@@ -370,7 +443,7 @@ async def run_engine():
         lot_size = calculate_position_size(1000.0, entry, sl)
 
         signal_report = (
-            f"👑 *إشارة الوحش 40.0*\n"
+            f"👑 *إشارة الوحش 39.0*\n"
             f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{trade_type}\n"
@@ -405,35 +478,4 @@ async def main():
             if last_report == current_time:
                 return
             db_set("last_report_time", current_time)
-        await send_telegram_msg(msg)
-
-# ==========================================
-# 🗄️ قاعدة البيانات (دوال مساعدة)
-# ==========================================
-def init_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.executescript("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);")
-    conn.commit()
-    return conn
-
-conn = init_db()
-
-def db_get(key, default=None):
-    r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
-    return r[0] if r else default
-
-def db_set(key, value):
-    conn.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (key, str(value)))
-    conn.commit()
-
-def is_in_killzone():
-    now = datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() >= 5: return False
-    t = now.hour + now.minute / 60
-    return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
-
-# ==========================================
-# 🚀 التشغيل
-# ==========================================
-if __name__ == '__main__':
-    asyncio.run(main())
+        await se
