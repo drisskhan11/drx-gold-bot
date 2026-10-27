@@ -460,7 +460,7 @@ async def run_engine():
         return None, f"❌ خطأ: {e}"
 
 # ==========================================
-# 🚀 التشغيل الرئيسي (بلا فلتر الساعة)
+# 🚀 التشغيل الرئيسي
 # ==========================================
 async def main():
     print(f"🕐 Starting Bot at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -477,4 +477,7 @@ async def main():
         await send_telegram_msg(msg)
         print("✅ Message sent successfully!")
     else:
-        
+        print("⚠️ No payload and no error returned from engine.")
+
+if __name__ == '__main__':
+    asyncio.run(main())
