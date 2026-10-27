@@ -15,9 +15,8 @@ from openai import OpenAI
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
 
-# ✅ الاستيراد الصحيح
+# ✅ مكتبة TickerLayer فقط (حيدنا FlashAlpha حيت غادي نستعملو requests مباشرة)
 try:
-    from flashalpha import FlashAlpha
     from tickerlayer import TickerLayer
     new_libs_enabled = True
 except ImportError:
@@ -49,14 +48,10 @@ try:
 except Exception:
     ai_enabled = False
 
-# ✅ تهيئة العملاء
+# ✅ تهيئة TickerLayer
 tl_client = None
-fa_client = None
-if new_libs_enabled:
-    if TICKERLAYER_API_KEY:
-        tl_client = TickerLayer(TICKERLAYER_API_KEY)
-    if FLASHALPHA_API_KEY:
-        fa_client = FlashAlpha(FLASHALPHA_API_KEY)
+if new_libs_enabled and TICKERLAYER_API_KEY:
+    tl_client = TickerLayer(TICKERLAYER_API_KEY)
 
 # ==========================================
 # 📱 إرسال تيليجرام
@@ -106,26 +101,27 @@ async def get_live_price():
         return None
 
 # ==========================================
-# 🔮 تحليل الجاما (FlashAlpha) - التصحيح
+# 🔮 تحليل الجاما (FlashAlpha) - النسخة التشخيصية
 # ==========================================
 async def get_gamma_analysis():
-    if not fa_client: 
-        logging.warning("FlashAlpha client not initialized.")
-        return None, None, None, None
+    if not FLASHALPHA_API_KEY:
+        return "مفتاح ناقص فـ GitHub Secrets", None, None, None
     try:
-        # ✅ نستعملو SPY حيت عندو سيولة كبيرة في الخيارات
-        gex = fa_client.gex("SPY")
-        net_gex = gex.get('net_gex')
-        gamma_flip = gex.get('gamma_flip') # يمكن يكون None
+        headers = {"X-Api-Key": FLASHALPHA_API_KEY}
+        # نستعملو requests مباشرة باش نشوفو كود الخطأ
+        r = requests.get("https://lab.flashalpha.com/v1/gex?symbol=SPY", headers=headers, timeout=10)
         
-        levels = fa_client.exposure_levels("SPY")
-        call_wall = levels.get('levels', {}).get('call_wall')
-        put_wall = levels.get('levels', {}).get('put_wall')
-        
-        return net_gex, gamma_flip, call_wall, put_wall
+        if r.status_code == 200:
+            data = r.json()
+            net_gex = data.get('net_gex')
+            if net_gex is None:
+                return "البيانات فارغة (None)", None, None, None
+            return str(net_gex), None, None, None
+        else:
+            # هادي هي اللي غادي تقولينا فين المشكل بالضبط (مثلاً HTTP 403)
+            return f"خطأ HTTP {r.status_code}", None, None, None
     except Exception as e:
-        logging.warning(f"FlashAlpha failed: {e}")
-        return None, None, None, None
+        return f"خطأ تقني: {str(e)[:20]}", None, None, None
 
 # ==========================================
 # 🌐 جلب البيانات
@@ -275,7 +271,7 @@ def is_news_dangerous():
     except: return False, "تعذر جلب الأخبار"
 
 # ==========================================
-# 🧠 إدارة حجم المركز
+# 🧠 إدارة حجم المركز (Kelly)
 # ==========================================
 def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     risk_per_unit = abs(entry - sl)
@@ -353,7 +349,8 @@ async def run_engine():
         poc, hot_zones = calculate_heatmap(df_h1)
         hidden_above, hidden_below = market_maker_simulation(df_h1)
 
-        net_gex, gamma_flip, call_wall, put_wall = await get_gamma_analysis()
+        # ✅ التعديل التشخيصي للجاما
+        gamma_status, _, _, _ = await get_gamma_analysis()
 
         if news_danger:
             return {"type": "NEWS", "msg": f"🚨 *تحذير أخبار:* {news_msg}"}, None
@@ -367,8 +364,6 @@ async def run_engine():
         signal_dir = 0
         if h4_dir == 1 and h1_dir == 1 and m15_dir == 1 and repricing_gate: signal_dir = 1
         elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1 and repricing_gate: signal_dir = -1
-
-        gamma_status = f"GEX={net_gex if net_gex else 'غير متاح'}"
 
         if signal_dir == 0:
             report = (
