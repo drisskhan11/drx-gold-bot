@@ -15,7 +15,7 @@ from openai import OpenAI
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.decomposition import PCA
 
-# ✅ استيراد المكتبات الجديدة (بدون TickerLayer)
+# ✅ استيراد المكتبات الجديدة
 try:
     from flashalpha import FlashAlpha
     import eulerpool
@@ -50,12 +50,14 @@ try:
 except Exception:
     ai_enabled = False
 
-# ✅ تهيئة العملاء
+# ✅ تهيئة العملاء (مع التصحيح)
 fa_client = None
 eu_client = None
 if new_libs_enabled:
-    if FLASHALPHA_API_KEY: fa_client = FlashAlpha(FLASHALPHA_API_KEY)
-    if EULERPOOL_API_KEY: eu_client = eulerpool.Client(EULERPOOL_API_KEY)
+    if FLASHALPHA_API_KEY: 
+        fa_client = FlashAlpha(FLASHALPHA_API_KEY)
+    if EULERPOOL_API_KEY: 
+        eu_client = eulerpool.Eulerpool(EULERPOOL_API_KEY) # ✅ التصحيح هنا
 
 # ==========================================
 # 📱 إرسال تيليجرام
@@ -93,7 +95,7 @@ def is_in_killzone():
     return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
 
 # ==========================================
-# 🔮 تحليل الجاما (FlashAlpha) - بالطريقة الرسمية
+# 🔮 تحليل الجاما (FlashAlpha)
 # ==========================================
 async def get_gamma_analysis():
     if not fa_client: return "مفتاح ناقص", None, None, None
@@ -117,7 +119,8 @@ async def get_gamma_analysis():
 async def get_gld_flows():
     if not eu_client: return "مفتاح ناقص"
     try:
-        flows = eu_client.etf.flows("GLD")
+        # ملاحظة: قد تحتاج لتعديل هاد الدالة حسب توثيق eulerpool
+        flows = eu_client.etf.flows("GLD") 
         if flows and 'net_flow' in flows:
             return f"${flows['net_flow']:,.0f}"
         return "غير متاح"
@@ -126,7 +129,7 @@ async def get_gld_flows():
         return "خطأ فالاتصال"
 
 # ==========================================
-# 🌐 جلب البيانات (yfinance فقط)
+# 🌐 جلب البيانات (yfinance)
 # ==========================================
 async def fetch_data(symbol, period, interval):
     try:
@@ -142,7 +145,7 @@ async def fetch_data(symbol, period, interval):
     return None
 
 # ==========================================
-# 🧠 العلوم المخفية (Hurst, ADR, SMC, ...)
+# 🧠 العلوم المخفية
 # ==========================================
 def calculate_hurst_exponent(price_series, max_lag=20):
     try:
@@ -160,6 +163,9 @@ def calculate_adr(df_d1):
         return round(df_d1['Range'].rolling(14).mean().iloc[-1], 2)
     except: return 0
 
+# ==========================================
+# 🧠 SMC والمؤشرات
+# ==========================================
 def analyze_smc(df, label):
     if df is None or len(df) < 50: return 0, None, f"{label}: بيانات غير كافية"
     try:
@@ -258,6 +264,9 @@ def is_news_dangerous():
         return False, "آمن"
     except: return False, "تعذر جلب الأخبار"
 
+# ==========================================
+# 🧠 إدارة حجم المركز (Position Sizing)
+# ==========================================
 def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     risk_per_unit = abs(entry - sl)
     if risk_per_unit == 0: return 0.01
@@ -269,6 +278,9 @@ def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
     lot_size = risk_amount / (risk_per_unit * 100)
     return max(0.01, round(lot_size, 2))
 
+# ==========================================
+# 🧠 مجلس العباقرة
+# ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
     أنت مجلس خبراء تداول (Multi-Agent System) مكون من 3 أعضاء.
@@ -303,6 +315,9 @@ async def ask_ai_council(data_summary):
         except: pass
     return "⚠️ AI غير متاح دابا."
 
+# ==========================================
+# 🚀 المحرك الرئيسي
+# ==========================================
 async def run_engine():
     try:
         macro_bias, macro_msg = await get_macro_bias()
