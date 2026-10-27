@@ -464,18 +464,19 @@ async def run_engine():
     except Exception as e:
         return None, f"❌ خطأ: {e}"
 
+# ==========================================
+# 🚀 التشغيل الرئيسي (بلا فلتر الساعة)
+# ==========================================
 async def main():
+    print(f"🕐 Starting Bot at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     payload, err = await run_engine()
+    
     if err:
+        print(f"❌ Error occurred: {err}")
         await send_telegram_msg(f"⚠️ *خطأ:*\n{err}")
         return
+        
     if payload:
         msg = payload["msg"]
-        msg_type = payload["type"]
-        if msg_type == "REPORT":
-            last_report = db_get("last_report_time")
-            current_time = datetime.now().strftime("%Y-%m-%d %H")
-            if last_report == current_time:
-                return
-            db_set("last_report_time", current_time)
-        await se
+        # ✅ حيدنا فلتر الساعة، دابا كيصيفط فكل مرة كيصحي
+ 
