@@ -25,7 +25,7 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
 FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
 
-DB_FILE = "quantum_beast_61.db"
+DB_FILE = "quantum_beast_62.db"
 NY = ZoneInfo("America/New_York")
 SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
 
@@ -35,7 +35,6 @@ try:
 except Exception:
     ai_client = None
 
-# تهيئة Twelve Data
 td = TDClient(apikey=TWELVEDATA_API_KEY) if TWELVEDATA_API_KEY else None
 
 # ==========================================
@@ -68,7 +67,7 @@ async def send_telegram_msg(text):
         logging.error(f"Telegram Error: {e}")
 
 # ==========================================
-# 🌐 جلب البيانات (السعر الفوري + شموع M15 و M1)
+# 🌐 جلب البيانات
 # ==========================================
 async def get_live_prices():
     try:
@@ -83,7 +82,6 @@ async def get_live_prices():
     return None, None
 
 async def fetch_candles(symbol, interval, limit=100):
-    # نستخدم yfinance فقط لشموع M15 و M1 (كافي للتحليل)
     try:
         yf_interval = "1m" if interval == "1m" else interval
         yf_period = "1d" if interval == "1m" else "5d"
@@ -96,19 +94,19 @@ async def fetch_candles(symbol, interval, limit=100):
     except: pass
     return None
 
-# ==========================================
-# 📊 جلب شمعة اليوم السابق من Twelve Data
-# ==========================================
 async def get_previous_day_ohlc():
     if not td:
         return None
     try:
-        # جلب آخر 5 شموع يومية
-        ts = td.time_series(symbol="XAU/USD", interval="1day", outputsize=5).as_pandas()
+        ts = td.time_series(symbol="XAU/USD", interval="1day", outputsize=10).as_pandas()
         if ts is None or ts.empty:
             return None
-        # الشمعة الأخيرة المكتملة هي اليوم السابق
-        prev = ts.iloc[-2]
+        ts.index = pd.to_datetime(ts.index)
+        today = datetime.now(NY).date()
+        past = ts[ts.index.date < today]
+        if past.empty:
+            return None
+        prev = past.iloc[-1]
         return {
             "open": float(prev["open"]),
             "high": float(prev["high"]),
@@ -182,7 +180,7 @@ def detect_judas_swing(df_m15, df_m1, pdh, pdl):
     return None, None, "كنسناو"
 
 # ==========================================
-# 🧠 مؤشرات إضافية
+# 🧠 مؤشرات إضافية (للتقرير الشامل)
 # ==========================================
 def calculate_hurst(prices, max_lag=20):
     try:
@@ -192,6 +190,36 @@ def calculate_hurst(prices, max_lag=20):
         tau = np.array([np.std(s[l:] - s[:-l]) for l in lags]); m = tau > 0
         return float(np.polyfit(np.log(lags[m]), np.log(tau[m]), 1)[0]) if m.sum() > 5 else 0.5
     except: return 0.5
+
+async def get_macro_and_intermarket():
+    try:
+        dxy = await fetch_candles("DX-Y.NYB", "1h", 50)
+        vix = await fetch_candles("^VIX", "1h", 50)
+        silver = await fetch_candles("SI=F", "1h", 50)
+        oil = await fetch_candles("CL=F", "1h", 50)
+        spx = await fetch_candles("^GSPC", "1h", 50)
+
+        macro = "NEUTRAL"
+        if dxy is not None and len(dxy) > 20:
+            dxy_bull = dxy['Close'].iloc[-1] > dxy['Close'].ewm(span=20).mean().iloc[-1]
+            macro = "BEARISH_GOLD" if dxy_bull else "BULLISH_GOLD"
+
+        vix_msg = "غير متاح"
+        if vix is not None:
+            vix_val = vix['Close'].iloc[-1]
+            vix_msg = f"{vix_val:.1f}"
+
+        intermarket = []
+        if silver is not None:
+            intermarket.append(f"🥈 فضة: {silver['Close'].iloc[-1]:.2f}")
+        if oil is not None:
+            intermarket.append(f"🛢️ نفط: {oil['Close'].iloc[-1]:.2f}")
+        if spx is not None:
+            intermarket.append(f"📉 S&P: {spx['Close'].iloc[-1]:.2f}")
+
+        return macro, vix_msg, " | ".join(intermarket)
+    except:
+        return "NEUTRAL", "غير متاح", "بيانات غير متاحة"
 
 # ==========================================
 # 🧠 مجلس العباقرة
@@ -239,61 +267,59 @@ async def ask_ai_council(data_summary):
 # ==========================================
 async def run_engine():
     try:
-        if not is_silver_bullet_time():
-            logging.info("💤 ماشي وقت الضربة الشيطانية. البوت ساكت.")
+        # 1. فلتر الوقت
+        in_silver_bullet = is_silver_bullet_time()
+        
+        if not in_silver_bullet and not FORCE_TEST:
+            # وضع الاستخبارات (خارج السيولة): تقرير مرة كل ساعة
+            now = datetime.now(NY)
+            if now.minute == 0:
+                current_price, _ = await get_live_prices()
+                macro, vix, intermarket = await get_macro_and_intermarket()
+                report = (
+                    f"👀 *مراقبة السوق (خارج السيولة)*\n"
+                    f"🕐 الوقت: `{now.strftime('%H:%M')}` (نيويورك)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 السعر: `{current_price:.2f}`\n"
+                    f"💵 الماكرو: {macro}\n"
+                    f"🌪️ VIX: {vix}\n"
+                    f"🌍 الأسواق: {intermarket}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🧐 *الوضع:* كنسناو وقت الضربة الشيطانية (3-4 و 10-11)."
+                )
+                return report, None
             return None, None
 
+        # 2. وضع القناص (Silver Bullet)
         news_blocked, news_msg = check_news_blackout()
         if news_blocked:
-            logging.info(f"⏸️ حظر أخبار: {news_msg}")
             return None, None
 
-        # جلب شمعة اليوم السابق من Twelve Data
         ohlc = await get_previous_day_ohlc()
         if not ohlc:
-            return None, "❌ تعذر جلب بيانات اليوم السابق من Twelve Data"
+            return None, "❌ تعذر جلب بيانات اليوم السابق"
 
-        pdh = ohlc["high"]
-        pdl = ohlc["low"]
+        pdh, pdl = ohlc["high"], ohlc["low"]
 
         df_m15 = await fetch_candles("GC=F", "15m", 100)
         df_m1 = await fetch_candles("GC=F", "1m", 100)
-
-        if any(d is None or len(d) < 20 for d in [df_m15, df_m1]):
-            return None, "❌ بيانات غير كافية"
+        if any(d is None for d in [df_m15, df_m1]):
+            return None, None
 
         direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
         
         if direction is None:
-            if FORCE_TEST:
-                current_price, _ = await get_live_prices()
-                test_msg = (
-                    f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
-                )
-                if current_price:
-                    test_msg += f"💰 السعر الحالي: `{current_price:.2f}`\n"
-                test_msg += (
-                    f"\n📊 *التحليل:*\n"
-                    f"- H4 و H1: تم التحليل ✅\n"
-                    f"- M15 و M1: تم التحليل ✅\n"
-                    f"- PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}`\n"
-                    f"\n🧐 *الوضع:* ما كاينش فخ دابا. البوت كينتظر.\n"
-                    f"💡 *ملاحظة:* فـ الوقت العادي، البوت كيخدم غير من 3-4 و 10-11 صباحاً (نيويورك)."
-                )
-                return test_msg, None
             return None, None
 
         current_price, _ = await get_live_prices()
-        if current_price is None: current_price = df_m1['Close'].iloc[-1]
         hurst = calculate_hurst(df_m15['Close'].values)
+        macro, vix, intermarket = await get_macro_and_intermarket()
 
         atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
         if abs(current_price - entry_zone) > (atr * 2.0):
             return None, None
 
-        ai_summary = f"Price: {current_price}\nSweep: {sweep_msg}\nEntry Zone: {entry_zone}\nHurst: {hurst}\nPDH: {pdh}\nPDL: {pdl}"
+        ai_summary = f"Price: {current_price}\nSweep: {sweep_msg}\nEntry: {entry_zone}\nHurst: {hurst}\nMacro: {macro}\nVIX: {vix}"
         ai_verdict = await ask_ai_council(ai_summary)
 
         if "انتظار" not in ai_verdict:
@@ -310,30 +336,26 @@ async def run_engine():
                 tp2 = round(entry_zone - risk * 4.0, 2)
                 trade_type = "🔴 بيع (Short)"
 
-            if risk <= 0: return None, "❌ خطأ في حساب الوقف"
-
-            signal_hash = f"{direction}_{entry_zone}_{sl}"
-            if db_get("last_signal") == signal_hash:
-                return None, None
-            db_set("last_signal", signal_hash)
-
             report = (
-                f"👑 *الوحش 61.4 (الضربة الشيطانية)*\n"
+                f"👑 *الوحش 62.0 (القناص + المستشار)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 السعر الحالي: `{current_price:.2f}`\n"
+                f"💰 السعر: `{current_price:.2f}`\n"
                 f"💀 *الضربة الشيطانية:* {sweep_msg}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 *الدخول (Limit):* `{entry_zone:.2f}`\n"
+                f"🎯 *الدخول:* `{entry_zone:.2f}`\n"
                 f"{trade_type}\n"
                 f"🛑 *الوقف:* `{sl:.2f}`\n"
-                f"🏆 *الهدف 1 (1:2):* `{tp1:.2f}`\n"
-                f"🚀 *الهدف 2 (1:4):* `{tp2:.2f}`\n"
+                f"🏆 *الهدف 1:* `{tp1:.2f}`\n"
+                f"🚀 *الهدف 2:* `{tp2:.2f}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 *الماكرو:* {macro}\n"
+                f"🌪️ *VIX:* {vix}\n"
+                f"🌍 *الأسواق:* {intermarket}\n"
                 f"🧠 *مجلس العباقرة:*\n{ai_verdict}\n"
             )
             return report, None
-            
+
         return None, None
 
     except Exception as e:
