@@ -7,14 +7,7 @@ import pandas as pd
 import numpy as np
 import telegram
 from openai import OpenAI
-
-try:
-    from biquote import Biquote
-    bq = Biquote()
-    bq_available = True
-except ImportError:
-    bq_available = False
-    logging.warning("Biquote not installed. Falling back to yfinance only.")
+from twelvedata import TDClient
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,8 +21,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
-# ✅ متغير الاختبار
 FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
 
 DB_FILE = "quantum_beast_61.db"
@@ -41,6 +34,9 @@ try:
     ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception:
     ai_client = None
+
+# تهيئة Twelve Data
+td = TDClient(apikey=TWELVEDATA_API_KEY) if TWELVEDATA_API_KEY else None
 
 # ==========================================
 # 🗄️ قاعدة البيانات
@@ -72,7 +68,7 @@ async def send_telegram_msg(text):
         logging.error(f"Telegram Error: {e}")
 
 # ==========================================
-# 🌐 جلب البيانات (XAUS + Biquote + yfinance)
+# 🌐 جلب البيانات (السعر الفوري + شموع M15 و M1)
 # ==========================================
 async def get_live_prices():
     try:
@@ -80,11 +76,6 @@ async def get_live_prices():
         if d.get("data_state", {}).get("status") == "fresh":
             return float(d["spot_usd_oz"]), float(d["silver_usd_oz"])
     except: pass
-    if bq_available:
-        try:
-            tick = bq.tick("XAUUSD")
-            if tick: return float(tick['mid']), None
-        except: pass
     try:
         gold = yf.Ticker("GC=F").history(period="1d", interval="1m")
         if not gold.empty: return float(gold["Close"].iloc[-1]), None
@@ -92,20 +83,7 @@ async def get_live_prices():
     return None, None
 
 async def fetch_candles(symbol, interval, limit=100):
-    if bq_available:
-        try:
-            bq_symbol = "XAUUSD" if symbol == "GC=F" else symbol
-            ohlc = bq.ohlc(bq_symbol, interval=interval, limit=limit)
-            if ohlc and 'bars' in ohlc:
-                df = pd.DataFrame(ohlc['bars'])
-                df['openTime'] = pd.to_datetime(df['openTime'])
-                df = df.set_index('openTime').sort_index()
-                df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
-                df.index = df.index.tz_localize("UTC").tz_convert(NY) if df.index.tz is None else df.index.tz_convert(NY)
-                return df
-        except Exception as e:
-            logging.warning(f"Biquote failed: {e}")
-
+    # نستخدم yfinance فقط لشموع M15 و M1 (كافي للتحليل)
     try:
         yf_interval = "1m" if interval == "1m" else interval
         yf_period = "1d" if interval == "1m" else "5d"
@@ -119,11 +97,33 @@ async def fetch_candles(symbol, interval, limit=100):
     return None
 
 # ==========================================
+# 📊 جلب شمعة اليوم السابق من Twelve Data
+# ==========================================
+async def get_previous_day_ohlc():
+    if not td:
+        return None
+    try:
+        # جلب آخر 5 شموع يومية
+        ts = td.time_series(symbol="XAU/USD", interval="1day", outputsize=5).as_pandas()
+        if ts is None or ts.empty:
+            return None
+        # الشمعة الأخيرة المكتملة هي اليوم السابق
+        prev = ts.iloc[-2]
+        return {
+            "open": float(prev["open"]),
+            "high": float(prev["high"]),
+            "low": float(prev["low"]),
+            "close": float(prev["close"])
+        }
+    except Exception as e:
+        logging.warning(f"Twelve Data failed: {e}")
+        return None
+
+# ==========================================
 # ⏰ فلتر الوقت والأخبار
 # ==========================================
 def is_silver_bullet_time():
-    if FORCE_TEST:
-        return True
+    if FORCE_TEST: return True
     now = datetime.now(NY)
     if now.weekday() >= 5: return False
     t = now.hour + now.minute / 60
@@ -248,24 +248,19 @@ async def run_engine():
             logging.info(f"⏸️ حظر أخبار: {news_msg}")
             return None, None
 
-        # ✅ زيادة عدد الشموع لتغطية اليوم السابق بدقة
-        df_m15 = await fetch_candles("GC=F", "15m", 500) 
+        # جلب شمعة اليوم السابق من Twelve Data
+        ohlc = await get_previous_day_ohlc()
+        if not ohlc:
+            return None, "❌ تعذر جلب بيانات اليوم السابق من Twelve Data"
+
+        pdh = ohlc["high"]
+        pdl = ohlc["low"]
+
+        df_m15 = await fetch_candles("GC=F", "15m", 100)
         df_m1 = await fetch_candles("GC=F", "1m", 100)
 
         if any(d is None or len(d) < 20 for d in [df_m15, df_m1]):
             return None, "❌ بيانات غير كافية"
-
-        # ✅ الحساب الدقيق لـ PDH و PDL من شموع 15 دقيقة
-        today = datetime.now(NY).date()
-        past_days = [d for d in set(df_m15.index.date) if d < today]
-        
-        if past_days:
-            last_trading_day = max(past_days)
-            last_day_data = df_m15[df_m15.index.date == last_trading_day]
-            pdh = last_day_data['High'].max()
-            pdl = last_day_data['Low'].min()
-        else:
-            return None, "❌ تعذر تحديد قمة وقاع اليوم السابق"
 
         direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
         
@@ -298,7 +293,7 @@ async def run_engine():
         if abs(current_price - entry_zone) > (atr * 2.0):
             return None, None
 
-        ai_summary = f"Price: {current_price}\nSweep: {sweep_msg}\nEntry Zone: {entry_zone}\nHurst: {hurst}"
+        ai_summary = f"Price: {current_price}\nSweep: {sweep_msg}\nEntry Zone: {entry_zone}\nHurst: {hurst}\nPDH: {pdh}\nPDL: {pdl}"
         ai_verdict = await ask_ai_council(ai_summary)
 
         if "انتظار" not in ai_verdict:
@@ -323,7 +318,7 @@ async def run_engine():
             db_set("last_signal", signal_hash)
 
             report = (
-                f"👑 *الوحش 61.3 (الضربة الشيطانية)*\n"
+                f"👑 *الوحش 61.4 (الضربة الشيطانية)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 السعر الحالي: `{current_price:.2f}`\n"
