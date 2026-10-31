@@ -1,19 +1,20 @@
-import os
-import sqlite3
-import warnings
-import logging
-import asyncio
+import os, sqlite3, warnings, logging, asyncio, requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
 import telegram
 from openai import OpenAI
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.decomposition import PCA
+
+try:
+    from biquote import Biquote
+    bq = Biquote()
+    bq_available = True
+except ImportError:
+    bq_available = False
+    logging.warning("Biquote not installed. Falling back to yfinance only.")
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,24 +23,40 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ⚙️ الإعدادات
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-DB_FILE = "quantum_beast_40.db"
-KILLZONE_LONDON = (2.0, 5.0)
-KILLZONE_NY = (7.0, 11.0)
-CONFLUENCE_THRESHOLD = 70
+DB_FILE = "quantum_beast_61.db"
+NY = ZoneInfo("America/New_York")
+SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
 
 try:
     from google import genai
-    ai_client = genai.Client(api_key=GEMINI_API_KEY)
-    AI_MODEL = "gemini-3.5-flash-lite"
-    ai_enabled = True
+    ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception:
-    ai_enabled = False
+    ai_client = None
+
+# ==========================================
+# 🗄️ قاعدة البيانات
+# ==========================================
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+conn.executescript("PRAGMA journal_mode=WAL;")
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, direction INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, status TEXT);
+""")
+conn.commit()
+
+def db_get(key, default=None):
+    r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    return r[0] if r else default
+
+def db_set(key, value):
+    conn.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (key, str(value)))
+    conn.commit()
 
 # ==========================================
 # 📱 إرسال تيليجرام
@@ -52,272 +69,145 @@ async def send_telegram_msg(text):
         logging.error(f"Telegram Error: {e}")
 
 # ==========================================
-# 🗄️ قاعدة البيانات
-# ==========================================
-def init_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.executescript("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);")
-    conn.commit()
-    return conn
-
-conn = init_db()
-
-def db_get(key, default=None):
-    r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
-    return r[0] if r else default
-
-def db_set(key, value):
-    conn.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (key, str(value)))
-    conn.commit()
-
-def is_in_killzone():
-    now = datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() >= 5: return False
-    t = now.hour + now.minute / 60
-    return (KILLZONE_LONDON[0] <= t < KILLZONE_LONDON[1]) or (KILLZONE_NY[0] <= t < KILLZONE_NY[1])
-
-# ==========================================
-# 🚀 XAUS API (السعر الفوري)
+# 🌐 جلب البيانات (Biquote + XAUS + yfinance)
 # ==========================================
 async def get_live_prices():
     try:
-        url = "https://xaus.com/api/v1/spot?compact=1"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            gold_price = data.get('spot_usd_oz')
-            silver_price = data.get('silver_usd_oz')
-            status = data.get('data_state', {}).get('status')
-            if status == 'fresh':
-                return round(gold_price, 2), round(silver_price, 2)
-    except Exception as e:
-        logging.warning(f"XAUS failed: {e}")
+        d = requests.get("https://xaus.com/api/v1/spot?compact=1", timeout=8).json()
+        if d.get("data_state", {}).get("status") == "fresh":
+            return float(d["spot_usd_oz"]), float(d["silver_usd_oz"])
+    except: pass
+    if bq_available:
+        try:
+            tick = bq.tick("XAUUSD")
+            if tick: return float(tick['mid']), None
+        except: pass
     try:
         gold = yf.Ticker("GC=F").history(period="1d", interval="1m")
-        silver = yf.Ticker("SI=F").history(period="1d", interval="1m")
-        if not gold.empty:
-            return round(gold['Close'].iloc[-1], 2), round(silver['Close'].iloc[-1], 2) if not silver.empty else None
+        if not gold.empty: return float(gold["Close"].iloc[-1]), None
     except: pass
     return None, None
 
-# ==========================================
-# 🌐 جلب البيانات (yfinance)
-# ==========================================
-async def fetch_data(symbol, period, interval):
+async def fetch_candles(symbol, interval, limit=100):
+    # 1. Biquote
+    if bq_available:
+        try:
+            bq_symbol = "XAUUSD" if symbol == "GC=F" else symbol
+            ohlc = bq.ohlc(bq_symbol, interval=interval, limit=limit)
+            if ohlc and 'bars' in ohlc:
+                df = pd.DataFrame(ohlc['bars'])
+                df['openTime'] = pd.to_datetime(df['openTime'])
+                df = df.set_index('openTime').sort_index()
+                df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                df.index = df.index.tz_localize("UTC").tz_convert(NY) if df.index.tz is None else df.index.tz_convert(NY)
+                return df
+        except Exception as e:
+            logging.warning(f"Biquote failed: {e}")
+
+    # 2. yfinance Fallback
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval)
-        if not df.empty: return df
-    except: pass
-    try:
-        ticker = yf.Ticker("XAUUSD=X" if symbol == "GC=F" else symbol)
-        df = ticker.history(period=period, interval=interval)
-        if not df.empty: return df
+        yf_interval = "1m" if interval == "1m" else interval
+        yf_period = "1d" if interval == "1m" else "5d"
+        ticker = yf.Ticker(symbol if symbol != "XAUUSD" else "GC=F")
+        df = ticker.history(period=yf_period, interval=yf_interval, auto_adjust=False)
+        if df is not None and not df.empty:
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            df.index = (df.index.tz_localize("UTC") if df.index.tz is None else df.index).tz_convert(NY)
+            return df
     except: pass
     return None
 
 # ==========================================
-# ⏰ حظر الأخبار الدقيق (Strict News Blackout)
+# ⏰ فلتر الوقت والأخبار
 # ==========================================
-def strict_news_blackout():
+def is_silver_bullet_time():
+    now = datetime.now(NY)
+    if now.weekday() >= 5: return False
+    t = now.hour + now.minute / 60
+    return any(start <= t < end for start, end in SILVER_BULLET_WINDOWS)
+
+def check_news_blackout():
     try:
-        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
-        news_data = r.json()
-        now_ny = datetime.now(ZoneInfo("America/New_York"))
-        critical = ["Federal Funds Rate", "Non-Farm Employment", "CPI", "FOMC", "PPI", "GDP"]
-        
-        for news in news_data:
-            if news.get('country') not in ['USD', 'XAU'] or news.get('impact') != 'High': continue
-            date_str = news.get('date', '')
-            if not date_str: continue
-            
-            news_time = pd.to_datetime(date_str).tz_localize(None).replace(tzinfo=ZoneInfo("America/New_York"))
-            title = news.get('title', '')
-            
-            diff_minutes = (news_time - now_ny).total_seconds() / 60
-            
-            if -45 <= diff_minutes <= 30 and any(k in title for k in critical):
-                return True, f"⏸️ حظر أخبار: {title} (بعد {int(diff_minutes)} دقيقة)"
-                
-        return False, "آمن"
-    except: return False, "تعذر جلب الأخبار"
+        res = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
+        now = datetime.now(NY)
+        critical = ["CPI", "FOMC", "Non-Farm", "PPI", "GDP", "Powell"]
+        for n in res:
+            if n.get("country") == "USD" and n.get("impact") == "High":
+                try:
+                    n_time = pd.to_datetime(n["date"], utc=True).tz_convert(NY)
+                    diff = (n_time - now).total_seconds() / 60
+                    if -45 <= diff <= 30 and any(k.lower() in n.get("title", "").lower() for k in critical):
+                        return True, f"⏸️ حظر أخبار: {n['title']}"
+                except: pass
+        return False, None
+    except: return False, None
 
 # ==========================================
-# 📊 تحليل التباعد (Volume Divergence) - الدالة اللي كانت ناقصة
+# 💀 كشف الفخ (Judas Swing) و CHoCH و FVG
 # ==========================================
-def detect_volume_divergence(df, label):
-    if df is None or len(df) < 20:
-        return False, "بيانات غير كافية"
-    try:
-        recent = df.tail(10)
-        price_trend = recent['Close'].iloc[-1] - recent['Close'].iloc[0]
-        volume_trend = recent['Volume'].iloc[-1] - recent['Volume'].iloc[0]
-        
-        if price_trend > 0 and volume_trend < 0:
-            return True, f"⚠️ {label}: تباعد هبوطي"
-        elif price_trend < 0 and volume_trend > 0:
-            return True, f"⚠️ {label}: تباعد صعودي"
-        return False, f"✅ {label}: لا يوجد تباعد"
-    except: return False, "خطأ"
+def detect_fvg(df, direction, lookback=5):
+    for i in range(-lookback, -1):
+        if direction == 1:
+            if df['Low'].iloc[i] > df['High'].iloc[i-2]:
+                return (df['High'].iloc[i-2], df['Low'].iloc[i])
+        else:
+            if df['High'].iloc[i] < df['Low'].iloc[i-2]:
+                return (df['High'].iloc[i], df['Low'].iloc[i-2])
+    return None
+
+def detect_judas_swing(df_m15, df_m1, pdh, pdl):
+    if df_m15 is None or df_m1 is None or len(df_m15) < 5 or len(df_m1) < 10:
+        return None, None, "بيانات غير كافية"
+    
+    recent_m15 = df_m15.tail(5)
+    swept_high = recent_m15['High'].max() > pdh
+    swept_low = recent_m15['Low'].min() < pdl
+    
+    if swept_high and not swept_low:
+        last_m1 = df_m1.tail(10)
+        if last_m1['Close'].iloc[-1] < last_m1['Low'].iloc[-3]:
+            fvg = detect_fvg(df_m1, -1)
+            entry = (fvg[0] + fvg[1]) / 2 if fvg else last_m1['High'].iloc[-3]
+            return -1, entry, "🔴 فخ فوق PDH + CHoCH هبوطي"
+    elif swept_low and not swept_high:
+        last_m1 = df_m1.tail(10)
+        if last_m1['Close'].iloc[-1] > last_m1['High'].iloc[-3]:
+            fvg = detect_fvg(df_m1, 1)
+            entry = (fvg[0] + fvg[1]) / 2 if fvg else last_m1['Low'].iloc[-3]
+            return 1, entry, "🟢 فخ تحت PDL + CHoCH صعودي"
+    return None, None, "كنسناو"
 
 # ==========================================
-# 🧠 المؤشرات والعلوم المخفية
+# 🧠 مؤشرات إضافية
 # ==========================================
-def calculate_hurst_exponent(price_series, max_lag=20):
+def calculate_hurst(prices, max_lag=20):
     try:
-        if len(price_series) < max_lag: return 0.5
-        lags = range(2, max_lag)
-        tau = [np.sqrt(np.std(np.subtract(price_series[lag:], price_series[:-lag]))) for lag in lags]
-        poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
-        return round(poly[0] * 2.0, 2)
+        s = np.log(np.asarray(prices, dtype=float))
+        lags = np.arange(2, min(max_lag, len(s)//3))
+        if len(lags) < 6: return 0.5
+        tau = np.array([np.std(s[l:] - s[:-l]) for l in lags]); m = tau > 0
+        return float(np.polyfit(np.log(lags[m]), np.log(tau[m]), 1)[0]) if m.sum() > 5 else 0.5
     except: return 0.5
-
-def calculate_adr(df_d1):
-    try:
-        if df_d1 is None or len(df_d1) < 14: return 0
-        df_d1['Range'] = df_d1['High'] - df_d1['Low']
-        return round(df_d1['Range'].rolling(14).mean().iloc[-1], 2)
-    except: return 0
-
-def analyze_smc(df, label):
-    if df is None or len(df) < 50: return 0, None, f"{label}: بيانات غير كافية"
-    try:
-        current_price = df['Close'].iloc[-1]
-        atr = (df['High'] - df['Low']).rolling(14).mean().iloc[-1]
-        ob_bull = df['Low'].shift(1).rolling(10).min().iloc[-1]
-        ob_bear = df['High'].shift(1).rolling(10).max().iloc[-1]
-        recent_high = df['High'].rolling(5).max().iloc[-1]
-        recent_low = df['Low'].rolling(5).min().iloc[-1]
-        sweep_bull = df['Low'].iloc[-1] < recent_low and df['Close'].iloc[-1] > recent_low
-        sweep_bear = df['High'].iloc[-1] > recent_high and df['Close'].iloc[-1] < recent_high
-        if sweep_bull: return 1, {'bottom': ob_bull}, f"{label}: 🟢 Sweep + Bullish OB"
-        if sweep_bear: return -1, {'top': ob_bear}, f"{label}: 🔴 Sweep + Bearish OB"
-        if abs(current_price - ob_bull) < atr * 2: return 1, {'bottom': ob_bull}, f"{label}: 🟢 Bullish OB"
-        elif abs(current_price - ob_bear) < atr * 2: return -1, {'top': ob_bear}, f"{label}: 🔴 Bearish OB"
-        return 0, None, f"{label}: محايد"
-    except: return 0, None, f"{label}: خطأ"
-
-def pca_analysis(df):
-    try:
-        if df is None or len(df) < 50: return None
-        features = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-        pca = PCA(n_components=1)
-        pca.fit(features)
-        return round(pca.explained_variance_ratio_[0] * 100, 2)
-    except: return None
-
-async def get_macro_bias():
-    try:
-        dxy = await fetch_data("DX-Y.NYB", "5d", "1h")
-        us10y = await fetch_data("^TNX", "5d", "1h")
-        if dxy is None or us10y is None: return "NEUTRAL", "بيانات غير مكتملة"
-        dxy_bull = dxy['Close'].iloc[-1] > dxy['Close'].ewm(span=20).mean().iloc[-1]
-        us10y_bull = us10y['Close'].iloc[-1] > us10y['Close'].ewm(span=20).mean().iloc[-1]
-        if dxy_bull and us10y_bull: return "BEARISH_GOLD", "💵 الدولار صاعد"
-        elif not dxy_bull and not us10y_bull: return "BULLISH_GOLD", "✨ الدولار هابط"
-        else: return "NEUTRAL", "⚖️ تضارب"
-    except: return "NEUTRAL", "تعذر"
-
-def calculate_stoch_rsi(df, period=14):
-    try:
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        stoch_rsi = (rsi - rsi.rolling(period).min()) / (rsi.rolling(period).max() - rsi.rolling(period).min())
-        return stoch_rsi.iloc[-1] * 100
-    except: return 50.0
-
-# ==========================================
-# 🧠 نظام النقاط (Confluence Scoring)
-# ==========================================
-def calculate_confluence_score(h4_dir, h1_dir, m15_dir, macro_bias, hurst, stoch_rsi, vol_divergence):
-    score = 0
-    details = []
-    
-    if h4_dir == 1 and h1_dir == 1 and m15_dir == 1:
-        score += 30
-        details.append("SMC: +30 (توافق صعود)")
-    elif h4_dir == -1 and h1_dir == -1 and m15_dir == -1:
-        score += 30
-        details.append("SMC: +30 (توافق هبوط)")
-    elif h4_dir == 1 and h1_dir == 1:
-        score += 15
-        details.append("SMC: +15 (توافق جزئي)")
-    else:
-        details.append("SMC: +0 (تضارب)")
-    
-    if (h4_dir == 1 and macro_bias == "BULLISH_GOLD") or (h4_dir == -1 and macro_bias == "BEARISH_GOLD"):
-        score += 20
-        details.append("Macro: +20 (متوافق)")
-    else:
-        details.append("Macro: +0 (غير متوافق)")
-    
-    if hurst > 0.55:
-        score += 20
-        details.append(f"Hurst: +20 ({hurst})")
-    elif hurst < 0.45:
-        score += 10
-        details.append(f"Hurst: +10 ({hurst})")
-    else:
-        details.append(f"Hurst: +0 ({hurst})")
-    
-    if (h4_dir == 1 and stoch_rsi < 40) or (h4_dir == -1 and stoch_rsi > 60):
-        score += 15
-        details.append(f"Momentum: +15 ({stoch_rsi:.1f})")
-    else:
-        details.append(f"Momentum: +0 ({stoch_rsi:.1f})")
-    
-    if not vol_divergence:
-        score += 15
-        details.append("Volume: +15")
-    else:
-        details.append("Volume: +0 (تباعد)")
-    
-    return score, details
-
-# ==========================================
-# 🧠 إدارة حجم المركز
-# ==========================================
-def calculate_position_size(account_balance, entry, sl, kelly_fraction=0.5):
-    risk_per_unit = abs(entry - sl)
-    if risk_per_unit == 0: return 0.01
-    win_rate = 0.45
-    reward_ratio = 2.5
-    kelly = (win_rate * reward_ratio - (1 - win_rate)) / reward_ratio
-    kelly = max(0.01, kelly * kelly_fraction)
-    risk_amount = account_balance * kelly
-    lot_size = risk_amount / (risk_per_unit * 100)
-    return max(0.01, round(lot_size, 2))
 
 # ==========================================
 # 🧠 مجلس العباقرة
 # ==========================================
 async def ask_ai_council(data_summary):
     prompt = f"""
-    أنت مجلس خبراء تداول (Multi-Agent System) مكون من 5 أعضاء.
-    المعطيات الحالية للسوق:
+    أنت مجلس خبراء تداول (Multi-Agent System).
+    المعطيات:
     {data_summary}
-
-    المطلوب منك أن تلعب الأدوار الخمسة بالدارجة المغربية:
-    1. 📊 [المحلل الفني]: حلل SMC و Hurst و Momentum.
-    2. 📰 [المحلل الأساسي]: حلل الماكرو والأخبار.
-    3. 🎭 [محلل المشاعر]: حلل Volume Divergence والفوليوم.
-    4. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل.
-    5. ⚖️ [مدير المخاطر]: أعطي القرار النهائي (شراء / بيع / انتظار) مع نسبة الثقة.
-
-    الرد يجب أن يكون بهذا الشكل:
-    📊 المحلل الفني: [جملة]
-    📰 المحلل الأساسي: [جملة]
-    🎭 محلل المشاعر: [جملة]
+    1. 🧠 [المحلل الفني]: قدم حجة.
+    2. 😈 [محامي الشيطان]: هاجم الصفقة!
+    3. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
+    الرد:
+    🧠 المحلل: [جملة]
     😈 محامي الشيطان: [جملة]
-    ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | الثقة: [%] | السبب: [جملة]
+    ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة]
     """
-    
-    if ai_enabled:
+    if ai_client:
         try:
-            response = await ai_client.aio.models.generate_content(model=AI_MODEL, contents=prompt)
+            response = await ai_client.aio.models.generate_content(model="gemini-3.5-flash-lite", contents=prompt)
             return response.text
         except: pass
     if GROQ_API_KEY:
@@ -338,116 +228,94 @@ async def ask_ai_council(data_summary):
             response = client.chat.completions.create(model="mistral-small-latest", messages=[{"role": "user", "content": prompt}])
             return response.choices[0].message.content
         except: pass
-    return "⚠️ جميع مزودي الذكاء الاصطناعي مشغولين دابا."
+    return "⚠️ AI غير متاح"
 
 # ==========================================
 # 🚀 المحرك الرئيسي
 # ==========================================
 async def run_engine():
     try:
-        news_blocked, news_msg = strict_news_blackout()
+        if not is_silver_bullet_time():
+            return None, None
+
+        news_blocked, news_msg = check_news_blackout()
         if news_blocked:
-            return {"type": "NEWS_BLACKOUT", "msg": f"🚨 *حظر أخبار صارم:*\n{news_msg}\n⏸️ البوت مامنعش أي تداول دابا."}, None
+            return None, None
 
-        macro_bias, macro_msg = await get_macro_bias()
+        df_m15 = await fetch_candles("GC=F", "15m", 50)
+        df_m1 = await fetch_candles("GC=F", "1m", 50)
+        df_d1 = await fetch_candles("GC=F", "1d", 5)
+
+        if any(d is None or len(d) < 2 for d in [df_m15, df_m1, df_d1]):
+            return None, "❌ بيانات غير كافية"
+
+        pdh = df_d1['High'].iloc[-2]
+        pdl = df_d1['Low'].iloc[-2]
+        direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
         
-        df_d1 = await fetch_data("GC=F", "1y", "1d"); await asyncio.sleep(1)
-        df_h4 = await fetch_data("GC=F", "3mo", "4h"); await asyncio.sleep(1)
-        df_h1 = await fetch_data("GC=F", "1mo", "1h"); await asyncio.sleep(1)
-        df_m15 = await fetch_data("GC=F", "5d", "15m")
+        if direction is None:
+            return None, None
 
-        if any(d is None for d in [df_d1, df_h4, df_h1, df_m15]):
-            return None, "❌ تعذر جلب بيانات."
+        current_price, _ = await get_live_prices()
+        if current_price is None: current_price = df_m1['Close'].iloc[-1]
+        hurst = calculate_hurst(df_m15['Close'].values)
 
-        current_price, silver_price = await get_live_prices()
-        if current_price is None:
-            current_price = df_m15['Close'].iloc[-1]
+        atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
+        if abs(current_price - entry_zone) > (atr * 2.0):
+            return None, None
 
-        h4_dir, _, h4_msg = analyze_smc(df_h4, "H4")
-        h1_dir, h1_ob, h1_msg = analyze_smc(df_h1, "H1")
-        m15_dir, m15_ob, m15_msg = analyze_smc(df_m15, "M15")
-        
-        hurst = calculate_hurst_exponent(df_h1['Close'].values)
-        adr = calculate_adr(df_d1)
-        stoch_rsi_val = calculate_stoch_rsi(df_m15)
-        vol_div, vol_div_msg = detect_volume_divergence(df_h1, "H1")
-        
-        score, score_details = calculate_confluence_score(h4_dir, h1_dir, m15_dir, macro_bias, hurst, stoch_rsi_val, vol_div)
-        
-        score_status = "🟢 ممتاز" if score >= 80 else "🟡 جيد" if score >= 70 else "🔴 ضعيف"
+        ai_summary = f"Price: {current_price}\nSweep: {sweep_msg}\nEntry Zone: {entry_zone}\nHurst: {hurst}"
+        ai_verdict = await ask_ai_council(ai_summary)
 
-        report = (
-            f"👑 *الوحش 40.0 (Confluence + AI Council)*\n"
-            f"🕐 الوقت: `{datetime.now(ZoneInfo('Africa/Casablanca')).strftime('%H:%M')}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 *النقاط: {score}/100* ({score_status})\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 السعر: `{current_price:.2f}`\n"
-            f"💵 الدولار: {macro_msg}\n"
-            f"📰 الأخبار: {news_msg}\n"
-            f"⚖️ Hurst: {hurst} | 📉 Stoch RSI: {stoch_rsi_val:.1f}\n"
-            f"📊 Volume: {vol_div_msg}\n"
-            f"📊 SMC: {h4_msg} | {h1_msg} | {m15_msg}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 *تفاصيل النقاط:*\n" + "\n".join(score_details) + "\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-        )
-
-        if score >= CONFLUENCE_THRESHOLD:
-            ai_summary = f"السعر: {current_price}\nSMC: H4={h4_dir}, H1={h1_dir}, M15={m15_dir}\nMacro: {macro_msg}\nHurst: {hurst}\nStoch RSI: {stoch_rsi_val:.1f}\nVolume Divergence: {vol_div_msg}\nConfluence Score: {score}/100"
-            ai_verdict = await ask_ai_council(ai_summary)
-            report += f"🧠 *مجلس العباقرة:*\n{ai_verdict}\n"
-            
-            if "انتظار" not in ai_verdict and ("شراء" in ai_verdict or "بيع" in ai_verdict):
-                atr_m15 = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
-                entry = round(current_price, 2)
-                if "شراء" in ai_verdict:
-                    sl = round(m15_ob['bottom'] - (atr_m15 * 0.8), 2)
-                    tp1 = round(entry + (entry - sl) * 1.5, 2)
-                    trade_type = "🟢 شراء كمي"
-                else:
-                    sl = round(m15_ob['top'] + (atr_m15 * 0.8), 2)
-                    tp1 = round(entry - (sl - entry) * 1.5, 2)
-                    trade_type = "🔴 بيع كمي"
-                
-                lot_size = calculate_position_size(1000.0, entry, sl)
-                report += (
-                    f"\n👑 *إشارة الوحش 40.0*\n"
-                    f"{trade_type}\n"
-                    f"🎯 *الدخول:* `{entry}`\n"
-                    f"🛑 *الوقف:* `{sl}`\n"
-                    f"🏆 *الهدف:* `{tp1}`\n"
-                    f"📦 *حجم المركز:* `{lot_size}` لوت\n"
-                )
+        if "انتظار" not in ai_verdict:
+            if direction == 1:
+                sl = round(df_m1['Low'].tail(5).min() - (atr * 0.2), 2)
+                risk = entry_zone - sl
+                tp1 = round(entry_zone + risk * 2.0, 2)
+                tp2 = round(entry_zone + risk * 4.0, 2)
+                trade_type = "🟢 شراء (Long)"
             else:
-                report += "\n⚖️ *مجلس العباقرة فضل الانتظار.*\n"
-        else:
-            report += f"\n🧐 *الوضع:* النقاط أقل من {CONFLUENCE_THRESHOLD}. البوت كينتظر توافق أحسن."
+                sl = round(df_m1['High'].tail(5).max() + (atr * 0.2), 2)
+                risk = sl - entry_zone
+                tp1 = round(entry_zone - risk * 2.0, 2)
+                tp2 = round(entry_zone - risk * 4.0, 2)
+                trade_type = "🔴 بيع (Short)"
 
-        return {"type": "REPORT", "msg": report}, None
+            if risk <= 0: return None, "❌ خطأ في حساب الوقف"
+
+            signal_hash = f"{direction}_{entry_zone}_{sl}"
+            if db_get("last_signal") == signal_hash:
+                return None, None
+            db_set("last_signal", signal_hash)
+
+            report = (
+                f"👑 *الوحش 61.0 (الضربة الشيطانية)*\n"
+                f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 السعر الحالي: `{current_price:.2f}`\n"
+                f"💀 *الضربة الشيطانية:* {sweep_msg}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 *الدخول (Limit):* `{entry_zone:.2f}`\n"
+                f"{trade_type}\n"
+                f"🛑 *الوقف:* `{sl:.2f}`\n"
+                f"🏆 *الهدف 1 (1:2):* `{tp1:.2f}`\n"
+                f"🚀 *الهدف 2 (1:4):* `{tp2:.2f}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧠 *مجلس العباقرة:*\n{ai_verdict}\n"
+            )
+            return report, None
+            
+        return None, None
 
     except Exception as e:
         return None, f"❌ خطأ: {e}"
 
-# ==========================================
-# 🚀 التشغيل الرئيسي
-# ==========================================
 async def main():
-    print(f"🕐 Starting Bot at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    payload, err = await run_engine()
-    
-    if err:
-        print(f"❌ Error occurred: {err}")
-        await send_telegram_msg(f"⚠️ *خطأ:*\n{err}")
-        return
-        
-    if payload:
-        msg = payload["msg"]
-        print("📤 Sending message to Telegram...")
-        await send_telegram_msg(msg)
-        print("✅ Message sent successfully!")
-    else:
-        print("⚠️ No payload and no error returned from engine.")
+    signal, err = await run_engine()
+    if err and "بيانات غير كافية" not in err:
+        await send_telegram_msg(err)
+    elif signal:
+        await send_telegram_msg(signal)
 
 if __name__ == '__main__':
     asyncio.run(main())
