@@ -5,4 +5,4 @@ numpy
 requests
 google-genai
 openai
-biquote
+twelvedata
