@@ -29,6 +29,9 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 
+# ✅ متغير الاختبار (إلا كان 1، كيتجاهل الوقت باش نتأكدو أن البوت خدام)
+FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
+
 DB_FILE = "quantum_beast_61.db"
 NY = ZoneInfo("America/New_York")
 SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
@@ -69,7 +72,7 @@ async def send_telegram_msg(text):
         logging.error(f"Telegram Error: {e}")
 
 # ==========================================
-# 🌐 جلب البيانات (Biquote + XAUS + yfinance)
+# 🌐 جلب البيانات
 # ==========================================
 async def get_live_prices():
     try:
@@ -89,7 +92,6 @@ async def get_live_prices():
     return None, None
 
 async def fetch_candles(symbol, interval, limit=100):
-    # 1. Biquote
     if bq_available:
         try:
             bq_symbol = "XAUUSD" if symbol == "GC=F" else symbol
@@ -104,7 +106,6 @@ async def fetch_candles(symbol, interval, limit=100):
         except Exception as e:
             logging.warning(f"Biquote failed: {e}")
 
-    # 2. yfinance Fallback
     try:
         yf_interval = "1m" if interval == "1m" else interval
         yf_period = "1d" if interval == "1m" else "5d"
@@ -118,15 +119,18 @@ async def fetch_candles(symbol, interval, limit=100):
     return None
 
 # ==========================================
-# ⏰ فلتر الوقت والأخبار
+# ⏰ فلتر الوقت (مع خاصية الاختبار)
 # ==========================================
 def is_silver_bullet_time():
+    if FORCE_TEST:
+        return True
     now = datetime.now(NY)
     if now.weekday() >= 5: return False
     t = now.hour + now.minute / 60
     return any(start <= t < end for start, end in SILVER_BULLET_WINDOWS)
 
 def check_news_blackout():
+    if FORCE_TEST: return False, None
     try:
         res = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
         now = datetime.now(NY)
@@ -236,10 +240,12 @@ async def ask_ai_council(data_summary):
 async def run_engine():
     try:
         if not is_silver_bullet_time():
+            logging.info("💤 ماشي وقت الضربة الشيطانية. البوت ساكت.")
             return None, None
 
         news_blocked, news_msg = check_news_blackout()
         if news_blocked:
+            logging.info(f"⏸️ حظر أخبار: {news_msg}")
             return None, None
 
         df_m15 = await fetch_candles("GC=F", "15m", 50)
@@ -254,6 +260,24 @@ async def run_engine():
         direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
         
         if direction is None:
+            if FORCE_TEST:
+                # فـ وضع الاختبار، نصيفطو رسالة باش نتأكدو
+                current_price, _ = await get_live_prices()
+                test_msg = (
+                    f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
+                    f"💰 السعر الحالي: `{current_price:.2f}`\n" if current_price else f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
+                )
+                test_msg += (
+                    f"\n📊 *التحليل:*\n"
+                    f"- H4 و H1: تم التحليل ✅\n"
+                    f"- M15 و M1: تم التحليل ✅\n"
+                    f"- PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}`\n"
+                    f"\n🧐 *الوضع:* ما كاينش فخ دابا. البوت كينتظر.\n"
+                    f"💡 *ملاحظة:* فـ الوقت العادي، البوت كيخدم غير من 3-4 و 10-11 صباحاً (نيويورك)."
+                )
+                return test_msg, None
             return None, None
 
         current_price, _ = await get_live_prices()
