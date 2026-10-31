@@ -72,7 +72,7 @@ async def send_telegram_msg(text):
         logging.error(f"Telegram Error: {e}")
 
 # ==========================================
-# 🌐 جلب البيانات
+# 🌐 جلب البيانات (XAUS + Biquote + yfinance)
 # ==========================================
 async def get_live_prices():
     try:
@@ -248,14 +248,14 @@ async def run_engine():
             logging.info(f"⏸️ حظر أخبار: {news_msg}")
             return None, None
 
-        # ✅ زيادة عدد شموع M15 لتغطية اليوم السابق
-        df_m15 = await fetch_candles("GC=F", "15m", 200) 
-        df_m1 = await fetch_candles("GC=F", "1m", 50)
+        # ✅ زيادة عدد الشموع لتغطية اليوم السابق بدقة
+        df_m15 = await fetch_candles("GC=F", "15m", 500) 
+        df_m1 = await fetch_candles("GC=F", "1m", 100)
 
         if any(d is None or len(d) < 20 for d in [df_m15, df_m1]):
             return None, "❌ بيانات غير كافية"
 
-        # ✅ الحساب الدقيق لـ PDH و PDL من شموع M15
+        # ✅ الحساب الدقيق لـ PDH و PDL من شموع 15 دقيقة
         today = datetime.now(NY).date()
         past_days = [d for d in set(df_m15.index.date) if d < today]
         
@@ -323,7 +323,7 @@ async def run_engine():
             db_set("last_signal", signal_hash)
 
             report = (
-                f"👑 *الوحش 61.2 (الضربة الشيطانية)*\n"
+                f"👑 *الوحش 61.3 (الضربة الشيطانية)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 السعر الحالي: `{current_price:.2f}`\n"
