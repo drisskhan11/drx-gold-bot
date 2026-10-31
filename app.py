@@ -29,7 +29,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 
-# ✅ متغير الاختبار (إلا كان 1، كيتجاهل الوقت باش نتأكدو أن البوت خدام)
+# ✅ متغير الاختبار
 FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
 
 DB_FILE = "quantum_beast_61.db"
@@ -119,7 +119,7 @@ async def fetch_candles(symbol, interval, limit=100):
     return None
 
 # ==========================================
-# ⏰ فلتر الوقت (مع خاصية الاختبار)
+# ⏰ فلتر الوقت والأخبار
 # ==========================================
 def is_silver_bullet_time():
     if FORCE_TEST:
@@ -248,27 +248,37 @@ async def run_engine():
             logging.info(f"⏸️ حظر أخبار: {news_msg}")
             return None, None
 
-        df_m15 = await fetch_candles("GC=F", "15m", 50)
+        # ✅ زيادة عدد شموع M15 لتغطية اليوم السابق
+        df_m15 = await fetch_candles("GC=F", "15m", 200) 
         df_m1 = await fetch_candles("GC=F", "1m", 50)
-        df_d1 = await fetch_candles("GC=F", "1d", 5)
 
-        if any(d is None or len(d) < 2 for d in [df_m15, df_m1, df_d1]):
+        if any(d is None or len(d) < 20 for d in [df_m15, df_m1]):
             return None, "❌ بيانات غير كافية"
 
-        pdh = df_d1['High'].iloc[-2]
-        pdl = df_d1['Low'].iloc[-2]
+        # ✅ الحساب الدقيق لـ PDH و PDL من شموع M15
+        today = datetime.now(NY).date()
+        past_days = [d for d in set(df_m15.index.date) if d < today]
+        
+        if past_days:
+            last_trading_day = max(past_days)
+            last_day_data = df_m15[df_m15.index.date == last_trading_day]
+            pdh = last_day_data['High'].max()
+            pdl = last_day_data['Low'].min()
+        else:
+            return None, "❌ تعذر تحديد قمة وقاع اليوم السابق"
+
         direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
         
         if direction is None:
             if FORCE_TEST:
-                # فـ وضع الاختبار، نصيفطو رسالة باش نتأكدو
                 current_price, _ = await get_live_prices()
                 test_msg = (
                     f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
-                    f"💰 السعر الحالي: `{current_price:.2f}`\n" if current_price else f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
                 )
+                if current_price:
+                    test_msg += f"💰 السعر الحالي: `{current_price:.2f}`\n"
                 test_msg += (
                     f"\n📊 *التحليل:*\n"
                     f"- H4 و H1: تم التحليل ✅\n"
@@ -313,7 +323,7 @@ async def run_engine():
             db_set("last_signal", signal_hash)
 
             report = (
-                f"👑 *الوحش 61.0 (الضربة الشيطانية)*\n"
+                f"👑 *الوحش 61.2 (الضربة الشيطانية)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 السعر الحالي: `{current_price:.2f}`\n"
