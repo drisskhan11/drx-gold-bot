@@ -24,7 +24,7 @@ jobs:
     - name: Cache State Database
       uses: actions/cache@v4
       with:
-        path: quantum_beast_61.db
+        path: quantum_beast_63.db
         key: ${{ runner.os }}-quantum-beast-db-${{ github.run_id }}
         restore-keys: |
           ${{ runner.os }}-quantum-beast-db-
