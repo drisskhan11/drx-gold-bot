@@ -25,7 +25,7 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
 FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
 
-DB_FILE = "quantum_beast_64.db"
+DB_FILE = "quantum_beast_66.db"
 NY = ZoneInfo("America/New_York")
 SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
 
@@ -65,6 +65,83 @@ async def send_telegram_msg(text):
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
     except Exception as e:
         logging.error(f"Telegram Error: {e}")
+
+# ==========================================
+# 📈 العائد الحقيقي (Real Yield - TIPS)
+# ==========================================
+async def get_real_yield_bias():
+    try:
+        # Autario API (مجاني، بدون مفتاح) - بيانات FRED DFII10
+        url = "https://autario.com/api/v1/public/datasets/1e5aab40-5930-4861-b286-17ce1cbb56f5/data?limit=2"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data and len(data) >= 2:
+                # نفترض أن البيانات مرتبة من الأحدث للأقدم
+                current = data[0]
+                previous = data[1]
+                current_yield = float(current.get('value', 0))
+                previous_yield = float(previous.get('value', 0))
+                
+                if current_yield > previous_yield:
+                    bias = "RISING"  # صاعد (سلبي للذهب)
+                elif current_yield < previous_yield:
+                    bias = "FALLING"  # هابط (إيجابي للذهب)
+                else:
+                    bias = "STABLE"
+                
+                return bias, current_yield
+    except Exception as e:
+        logging.warning(f"Real Yield fetch failed: {e}")
+    
+    return "NEUTRAL", 0.0
+
+# ==========================================
+# 🐋 COT Report (متتبع الحيتان)
+# ==========================================
+async def get_cot_bias():
+    last_fetch_str = db_get("cot_last_fetch")
+    today = datetime.now(NY).date()
+    if last_fetch_str:
+        try:
+            last_fetch = datetime.fromisoformat(last_fetch_str).date()
+            if (today - last_fetch).days < 7:
+                cached = db_get("cot_bias")
+                if cached:
+                    return cached, db_get("cot_net", "0")
+        except: pass
+    
+    try:
+        url = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+        params = {
+            "$limit": 1,
+            "$order": "report_date_as_yyyy_mm_dd DESC",
+            "$where": "market_and_exchange_names like '%GOLD%'"
+        }
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                row = data[0]
+                comm_long = float(row.get('comm_positions_long_all', 0))
+                comm_short = float(row.get('comm_positions_short_all', 0))
+                net = comm_long - comm_short
+                
+                if net > 50000:
+                    bias = "BULLISH"
+                elif net < -150000:
+                    bias = "BEARISH"
+                else:
+                    bias = "NEUTRAL"
+                
+                db_set("cot_bias", bias)
+                db_set("cot_net", str(int(net)))
+                db_set("cot_last_fetch", today.isoformat())
+                return bias, str(int(net))
+    except Exception as e:
+        logging.warning(f"COT fetch failed: {e}")
+    
+    return "NEUTRAL", "غير متاح"
 
 # ==========================================
 # 🌐 جلب البيانات
@@ -115,7 +192,7 @@ async def get_previous_day_ohlc():
         return None
 
 # ==========================================
-# 🏭 تحليل GDX (أسهم التعدين) والأخبار
+# 🏭 GDX والأخبار
 # ==========================================
 async def get_gdx_trend():
     try:
@@ -137,7 +214,7 @@ async def get_news_headlines():
         return "تعذر جلب الأخبار."
 
 # ==========================================
-# ⏰ فلتر الوقت والأخبار
+# ⏰ فلاتر الوقت والأخبار
 # ==========================================
 def is_silver_bullet_time():
     if FORCE_TEST: return True
@@ -245,13 +322,17 @@ async def ask_ai_council(data_summary):
     أنت مجلس خبراء تداول (Multi-Agent System).
     المعطيات:
     {data_summary}
-    1. 🧠 [المحلل الفني]: قدم حجة بناءً على المعطيات.
-    2. 📰 [محلل الأخبار]: حلل العناوين المرفقة، هل تدعم الذهب (خطر جيوسياسي) أم لا؟
-    3. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (مثلاً تعارض GDX مع اتجاه الذهب).
-    4. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
+    1. 🧠 [المحلل الفني]: قدم حجة بناءً على SMC و Hurst.
+    2. 📰 [محلل الأخبار]: حلل العناوين، هل تدعم الذهب أم لا؟
+    3. 📈 [محلل العائد الحقيقي]: حلل اتجاه TIPS. العائد الصاعد كيخنق الذهب، والهابط كيدعمو.
+    4. 🐋 [محلل الحيتان]: حلل COT. واش البنوك كيشريو ولا كيبيعو؟
+    5. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل.
+    6. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
     الرد:
     🧠 المحلل: [جملة]
-    📰 محلل الأخبار: [جملة]
+    📰 الأخبار: [جملة]
+    📈 العائد الحقيقي: [جملة]
+    🐋 الحيتان: [جملة]
     😈 محامي الشيطان: [جملة]
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة]
     """
@@ -281,12 +362,12 @@ async def ask_ai_council(data_summary):
     return "⚠️ AI غير متاح"
 
 # ==========================================
-# 🚀 المحرك الرئيسي (مع فلتر GDX والأخبار)
+# 🚀 المحرك الرئيسي (مع Real Yield)
 # ==========================================
 async def run_engine():
     try:
         if not is_silver_bullet_time():
-            logging.info("💤 ماشي وقت الضربة الشيطانية. البوت ساكت.")
+            logging.info("💤 ماشي وقت الضربة الشيطانية.")
             return None, None
 
         news_blocked, news_msg = check_news_blackout()
@@ -307,6 +388,10 @@ async def run_engine():
 
         direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
         
+        # ✅ جلب بيانات COT و Real Yield
+        cot_bias, cot_net = await get_cot_bias()
+        ry_bias, ry_value = await get_real_yield_bias()
+        
         if direction is None:
             if FORCE_TEST:
                 current_price, _ = await get_live_prices()
@@ -322,18 +407,36 @@ async def run_engine():
                     f"\n📊 *التحليل:*\n"
                     f"- PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}`\n"
                     f"- GDX (التعدين): {gdx}\n"
+                    f"- COT (الحيتان): {cot_bias} (Net: {cot_net})\n"
+                    f"- Real Yield (TIPS): {ry_bias} ({ry_value:.2f}%)\n"
                     f"\n🧐 *الوضع:* ما كاينش فخ دابا. البوت كينتظر."
                 )
                 return test_msg, None
             return None, None
 
-        # ✅ فلتر GDX الصارم
+        # ✅ فلتر GDX
         gdx_trend = await get_gdx_trend()
         if direction == 1 and gdx_trend == "BEARISH":
-            logging.info("GDX Divergence: Gold Buy signal ignored (GDX Bearish).")
+            logging.info("GDX Divergence: Buy signal ignored.")
             return None, None
         elif direction == -1 and gdx_trend == "BULLISH":
-            logging.info("GDX Divergence: Gold Sell signal ignored (GDX Bullish).")
+            logging.info("GDX Divergence: Sell signal ignored.")
+            return None, None
+
+        # ✅ فلتر COT
+        if direction == 1 and cot_bias == "BEARISH":
+            logging.info(f"COT Divergence: Buy signal ignored (COT: {cot_bias}).")
+            return None, None
+        elif direction == -1 and cot_bias == "BULLISH":
+            logging.info(f"COT Divergence: Sell signal ignored (COT: {cot_bias}).")
+            return None, None
+
+        # ✅ فلتر Real Yield الصارم
+        if direction == 1 and ry_bias == "RISING":
+            logging.info(f"Real Yield Divergence: Buy signal ignored (RY: {ry_bias}, {ry_value:.2f}%).")
+            return None, None
+        elif direction == -1 and ry_bias == "FALLING":
+            logging.info(f"Real Yield Divergence: Sell signal ignored (RY: {ry_bias}, {ry_value:.2f}%).")
             return None, None
 
         current_price, _ = await get_live_prices()
@@ -346,7 +449,6 @@ async def run_engine():
         if abs(current_price - entry_zone) > (atr * 2.0):
             return None, None
 
-        # ✅ تمرير الأخبار و GDX لمجلس العباقرة
         ai_summary = f"""
         Price: {current_price}
         Sweep: {sweep_msg}
@@ -355,6 +457,8 @@ async def run_engine():
         Macro: {macro}
         VIX: {vix}
         GDX Trend: {gdx_trend}
+        COT Bias: {cot_bias} (Net: {cot_net})
+        Real Yield: {ry_bias} ({ry_value:.2f}%)
         Latest News: {news_headlines}
         """
         ai_verdict = await ask_ai_council(ai_summary)
@@ -381,13 +485,15 @@ async def run_engine():
             db_set("last_signal", signal_hash)
 
             report = (
-                f"👑 *الوحش 64.0 (القناص + GDX + AI News)*\n"
+                f"👑 *الوحش 66.0 (القناص + GDX + AI + COT + Real Yield)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 السعر: `{current_price:.2f}`\n"
                 f"💀 *الضربة الشيطانية:* {sweep_msg}\n"
                 f"🏭 *GDX (التعدين):* {gdx_trend}\n"
-                f"📰 *الأخبار:* {news_headlines[:100]}...\n" # Truncated for brevity
+                f"🐋 *COT (الحيتان):* {cot_bias} (Net: {cot_net})\n"
+                f"📈 *Real Yield (TIPS):* {ry_bias} ({ry_value:.2f}%)\n"
+                f"📰 *الأخبار:* {news_headlines[:100]}...\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 *الدخول:* `{entry_zone:.2f}`\n"
                 f"{trade_type}\n"
