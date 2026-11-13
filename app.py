@@ -25,7 +25,7 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
 FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
 
-DB_FILE = "quantum_beast_64.db"
+DB_FILE = "quantum_beast_67.db"
 NY = ZoneInfo("America/New_York")
 SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
 
@@ -115,17 +115,18 @@ async def get_previous_day_ohlc():
         return None
 
 # ==========================================
-# 🏭 تحليل GDX (أسهم التعدين) والأخبار
+# 🏭 GDX والأخبار
 # ==========================================
 async def get_gdx_trend():
     try:
         gdx = yf.Ticker("GDX").history(period="5d", interval="1h")
-        if gdx.empty: return "NEUTRAL"
+        if gdx.empty: return "NEUTRAL", 0
         ema = gdx['Close'].ewm(span=20).mean().iloc[-1]
         current = gdx['Close'].iloc[-1]
-        return "BULLISH" if current > ema else "BEARISH"
+        strength = ((current - ema) / ema) * 100
+        return ("BULLISH" if current > ema else "BEARISH"), round(strength, 2)
     except:
-        return "NEUTRAL"
+        return "NEUTRAL", 0
 
 async def get_news_headlines():
     try:
@@ -137,7 +138,49 @@ async def get_news_headlines():
         return "تعذر جلب الأخبار."
 
 # ==========================================
-# ⏰ فلتر الوقت والأخبار
+# 🎯 وعي السياق (Context Awareness)
+# ==========================================
+async def get_context_score(direction):
+    try:
+        dxy = await fetch_candles("DX-Y.NYB", "1h", 50)
+        vix = await fetch_candles("^VIX", "1h", 50)
+        tnx = await fetch_candles("^TNX", "1h", 50)
+        
+        score = 0
+        
+        # VIX: خوف عالي = دعم للذهب
+        if vix is not None:
+            vix_val = vix['Close'].iloc[-1]
+            if vix_val > 20: score += 15  # خوف عالي يدعم الشراء، وضغط على البيع
+            elif vix_val < 15: score -= 5
+        
+        # DXY: الدولار
+        if dxy is not None and len(dxy) > 20:
+            dxy_bull = dxy['Close'].iloc[-1] > dxy['Close'].ewm(span=20).mean().iloc[-1]
+            if direction == 1 and not dxy_bull: score += 20  # دولار هابط = دعم شراء
+            elif direction == -1 and dxy_bull: score += 20  # دولار صاعد = دعم بيع
+        
+        # TNX: عائد 10 سنوات
+        if tnx is not None:
+            tnx_bull = tnx['Close'].iloc[-1] > tnx['Close'].ewm(span=20).mean().iloc[-1]
+            if direction == 1 and not tnx_bull: score += 15
+            elif direction == -1 and tnx_bull: score += 15
+        
+        return max(0, min(100, score + 30))  # Base 30 + bonuses
+    except:
+        return 30  # Default
+
+async def get_volume_confirmation(df_m15):
+    try:
+        if len(df_m15) < 20: return False
+        vol_avg = df_m15['Volume'].tail(20).mean()
+        vol_current = df_m15['Volume'].iloc[-1]
+        return vol_current > vol_avg * 1.2
+    except:
+        return False
+
+# ==========================================
+# ⏰ فلاتر الوقت والأخبار
 # ==========================================
 def is_silver_bullet_time():
     if FORCE_TEST: return True
@@ -199,7 +242,7 @@ def detect_judas_swing(df_m15, df_m1, pdh, pdl):
     return None, None, "كنسناو"
 
 # ==========================================
-# 🧠 مؤشرات إضافية والماكرو
+# 🧠 مؤشرات إضافية
 # ==========================================
 def calculate_hurst(prices, max_lag=20):
     try:
@@ -224,8 +267,7 @@ async def get_macro_and_intermarket():
 
         vix_msg = "غير متاح"
         if vix is not None:
-            vix_val = vix['Close'].iloc[-1]
-            vix_msg = f"{vix_val:.1f}"
+            vix_msg = f"{vix['Close'].iloc[-1]:.1f}"
 
         intermarket = []
         if silver is not None:
@@ -245,13 +287,15 @@ async def ask_ai_council(data_summary):
     أنت مجلس خبراء تداول (Multi-Agent System).
     المعطيات:
     {data_summary}
-    1. 🧠 [المحلل الفني]: قدم حجة بناءً على المعطيات.
-    2. 📰 [محلل الأخبار]: حلل العناوين المرفقة، هل تدعم الذهب (خطر جيوسياسي) أم لا؟
-    3. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (مثلاً تعارض GDX مع اتجاه الذهب).
-    4. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
+    1. 🧠 [المحلل الفني]: قدم حجة بناءً على SMC و Hurst.
+    2. 📰 [محلل الأخبار]: حلل العناوين، هل تدعم الذهب أم لا؟
+    3. 🏭 [محلل المعادن]: حلل GDX و COT.
+    4. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل.
+    5. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
     الرد:
     🧠 المحلل: [جملة]
-    📰 محلل الأخبار: [جملة]
+    📰 الأخبار: [جملة]
+    🏭 المعادن: [جملة]
     😈 محامي الشيطان: [جملة]
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة]
     """
@@ -278,15 +322,15 @@ async def ask_ai_council(data_summary):
             response = client.chat.completions.create(model="mistral-small-latest", messages=[{"role": "user", "content": prompt}])
             return response.choices[0].message.content
         except: pass
-    return "⚠️ AI غير متاح"
+    return None  # AI Not Available
 
 # ==========================================
-# 🚀 المحرك الرئيسي (مع فلتر GDX والأخبار)
+# 🚀 المحرك الرئيسي (مع وعي السياق)
 # ==========================================
 async def run_engine():
     try:
         if not is_silver_bullet_time():
-            logging.info("💤 ماشي وقت الضربة الشيطانية. البوت ساكت.")
+            logging.info("💤 ماشي وقت الضربة الشيطانية.")
             return None, None
 
         news_blocked, news_msg = check_news_blackout()
@@ -310,30 +354,49 @@ async def run_engine():
         if direction is None:
             if FORCE_TEST:
                 current_price, _ = await get_live_prices()
-                gdx = await get_gdx_trend()
+                gdx_trend, gdx_strength = await get_gdx_trend()
+                ctx_score = await get_context_score(0)
                 test_msg = (
                     f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 )
                 if current_price:
-                    test_msg += f"💰 السعر الحالي: `{current_price:.2f}`\n"
+                    test_msg += f"💰 السعر: `{current_price:.2f}`\n"
                 test_msg += (
                     f"\n📊 *التحليل:*\n"
                     f"- PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}`\n"
-                    f"- GDX (التعدين): {gdx}\n"
+                    f"- GDX: {gdx_trend} ({gdx_strength}%)\n"
+                    f"- Context Score: {ctx_score}/100\n"
                     f"\n🧐 *الوضع:* ما كاينش فخ دابا. البوت كينتظر."
                 )
                 return test_msg, None
             return None, None
 
-        # ✅ فلتر GDX الصارم
-        gdx_trend = await get_gdx_trend()
+        # ✅ فلتر GDX
+        gdx_trend, gdx_strength = await get_gdx_trend()
         if direction == 1 and gdx_trend == "BEARISH":
-            logging.info("GDX Divergence: Gold Buy signal ignored (GDX Bearish).")
+            logging.info("GDX Divergence: Buy signal ignored.")
             return None, None
         elif direction == -1 and gdx_trend == "BULLISH":
-            logging.info("GDX Divergence: Gold Sell signal ignored (GDX Bullish).")
+            logging.info("GDX Divergence: Sell signal ignored.")
+            return None, None
+        
+        # ✅ فلتر قوة GDX (إلا كان ضعيف بزاف، ما ندخلوش)
+        if abs(gdx_strength) < 0.5:
+            logging.info(f"GDX Too Weak: {gdx_strength}%. Ignoring.")
+            return None, None
+
+        # ✅ وعي السياق
+        ctx_score = await get_context_score(direction)
+        if ctx_score < 40:
+            logging.info(f"Context Score Too Low: {ctx_score}. Ignoring.")
+            return None, None
+
+        # ✅ تأكيد الفوليوم
+        vol_ok = await get_volume_confirmation(df_m15)
+        if not vol_ok:
+            logging.info("Volume Too Low. Ignoring.")
             return None, None
 
         current_price, _ = await get_live_prices()
@@ -346,7 +409,6 @@ async def run_engine():
         if abs(current_price - entry_zone) > (atr * 2.0):
             return None, None
 
-        # ✅ تمرير الأخبار و GDX لمجلس العباقرة
         ai_summary = f"""
         Price: {current_price}
         Sweep: {sweep_msg}
@@ -354,21 +416,33 @@ async def run_engine():
         Hurst: {hurst}
         Macro: {macro}
         VIX: {vix}
-        GDX Trend: {gdx_trend}
+        GDX: {gdx_trend} ({gdx_strength}%)
+        Context Score: {ctx_score}/100
         Latest News: {news_headlines}
         """
         ai_verdict = await ask_ai_council(ai_summary)
+        
+        # ✅ حماية AI: إلا كان غير متاح، ماغاديش نصيفطو الإشارة
+        if ai_verdict is None:
+            logging.warning("AI Unavailable: Signal blocked for safety.")
+            return None, None
 
         if "انتظار" not in ai_verdict:
             if direction == 1:
                 sl = round(df_m1['Low'].tail(5).min() - (atr * 0.2), 2)
                 risk = entry_zone - sl
+                if risk < 5:  # حد أدنى 5 نقاط
+                    risk = 5
+                    sl = round(entry_zone - 5, 2)
                 tp1 = round(entry_zone + risk * 2.0, 2)
                 tp2 = round(entry_zone + risk * 4.0, 2)
                 trade_type = "🟢 شراء (Long)"
             else:
                 sl = round(df_m1['High'].tail(5).max() + (atr * 0.2), 2)
                 risk = sl - entry_zone
+                if risk < 5:
+                    risk = 5
+                    sl = round(entry_zone + 5, 2)
                 tp1 = round(entry_zone - risk * 2.0, 2)
                 tp2 = round(entry_zone - risk * 4.0, 2)
                 trade_type = "🔴 بيع (Short)"
@@ -381,13 +455,14 @@ async def run_engine():
             db_set("last_signal", signal_hash)
 
             report = (
-                f"👑 *الوحش 64.0 (القناص + GDX + AI News)*\n"
+                f"👑 *الوحش 67.0 (الوعي بالسياق)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 السعر: `{current_price:.2f}`\n"
                 f"💀 *الضربة الشيطانية:* {sweep_msg}\n"
-                f"🏭 *GDX (التعدين):* {gdx_trend}\n"
-                f"📰 *الأخبار:* {news_headlines[:100]}...\n" # Truncated for brevity
+                f"🏭 *GDX:* {gdx_trend} ({gdx_strength}%)\n"
+                f"🎯 *Context Score:* {ctx_score}/100\n"
+                f"📰 *الأخبار:* {news_headlines[:100]}...\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 *الدخول:* `{entry_zone:.2f}`\n"
                 f"{trade_type}\n"
