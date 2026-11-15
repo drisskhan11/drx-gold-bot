@@ -6,3 +6,4 @@ requests
 google-genai
 openai
 twelvedata
+scipy
