@@ -8,6 +8,7 @@ import numpy as np
 import telegram
 from openai import OpenAI
 from twelvedata import TDClient
+from scipy import stats
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,7 +26,7 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
 FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
 
-DB_FILE = "quantum_beast_67.db"
+DB_FILE = "quantum_beast_68.db"
 NY = ZoneInfo("America/New_York")
 SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
 
@@ -44,7 +45,7 @@ conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 conn.executescript("PRAGMA journal_mode=WAL;")
 conn.executescript("""
 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, direction INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, status TEXT);
+CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, direction INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, status TEXT, mc_prob REAL);
 """)
 conn.commit()
 
@@ -65,6 +66,83 @@ async def send_telegram_msg(text):
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
     except Exception as e:
         logging.error(f"Telegram Error: {e}")
+
+# ==========================================
+# 🎲 محاكاة مونت كارلو (Einstein Core)
+# ==========================================
+def monte_carlo_probability(current_price, sl, tp, atr, direction, simulations=500):
+    """
+    محاكاة 500 سيناريو مستقبلي باستخدام Geometric Brownian Motion
+    ترجع احتمالية الوصول للهدف قبل الوقف
+    """
+    try:
+        # التقلب المستند على ATR
+        sigma = atr / current_price  # تقلب نسبي
+        mu = 0  # افتراض السوق العشوائي (Random Walk)
+        steps = 60  # 60 خطوة (~24 ساعة إذا كل خطوة 24 دقيقة)
+        dt = 1 / steps
+        
+        wins = 0
+        for _ in range(simulations):
+            price = current_price
+            for step in range(steps):
+                # Brownian Motion
+                shock = np.random.normal(0, 1)
+                price *= np.exp((mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * shock)
+                
+                # فحص الوقف
+                if direction == 1 and price <= sl:
+                    break
+                if direction == -1 and price >= sl:
+                    break
+                
+                # فحص الهدف
+                if direction == 1 and price >= tp:
+                    wins += 1
+                    break
+                if direction == -1 and price <= tp:
+                    wins += 1
+                    break
+        
+        return round(wins / simulations, 3)
+    except:
+        return 0.5  # افتراضي
+
+# ==========================================
+# 🎯 مؤشر الألم (Pain Index)
+# ==========================================
+async def calculate_pain_index(df_m15, current_price):
+    """
+    كيحسب فين كاينة كثافة الستوبات (أرقام مستديرة + قمم/قيعان واضحة)
+    ترجع درجة من 0 لـ 100 (كلما زادت، كلما زاد الألم)
+    """
+    try:
+        if df_m15 is None or len(df_m15) < 20:
+            return 50
+        
+        pain_score = 0
+        
+        # 1. الأرقام المستديرة (كل 50 نقطة)
+        round_levels = [round(current_price / 50) * 50 + (i * 50) for i in range(-2, 3)]
+        for level in round_levels:
+            if level != current_price and abs(current_price - level) < 5:
+                pain_score += 15
+        
+        # 2. القمم والقيعان الواضحة
+        recent = df_m15.tail(30)
+        local_highs = recent['High'].rolling(5).max()
+        local_lows = recent['Low'].rolling(5).min()
+        
+        for h in local_highs.dropna().tail(5):
+            if abs(current_price - h) < 5:
+                pain_score += 10
+        for l in local_lows.dropna().tail(5):
+            if abs(current_price - l) < 5:
+                pain_score += 10
+        
+        return min(100, pain_score)
+    except:
+        return 50
 
 # ==========================================
 # 🌐 جلب البيانات
@@ -138,7 +216,7 @@ async def get_news_headlines():
         return "تعذر جلب الأخبار."
 
 # ==========================================
-# 🎯 وعي السياق (Context Awareness)
+# 🎯 وعي السياق
 # ==========================================
 async def get_context_score(direction):
     try:
@@ -146,29 +224,26 @@ async def get_context_score(direction):
         vix = await fetch_candles("^VIX", "1h", 50)
         tnx = await fetch_candles("^TNX", "1h", 50)
         
-        score = 0
+        score = 30  # Base
         
-        # VIX: خوف عالي = دعم للذهب
         if vix is not None:
             vix_val = vix['Close'].iloc[-1]
-            if vix_val > 20: score += 15  # خوف عالي يدعم الشراء، وضغط على البيع
+            if vix_val > 20: score += 15
             elif vix_val < 15: score -= 5
         
-        # DXY: الدولار
         if dxy is not None and len(dxy) > 20:
             dxy_bull = dxy['Close'].iloc[-1] > dxy['Close'].ewm(span=20).mean().iloc[-1]
-            if direction == 1 and not dxy_bull: score += 20  # دولار هابط = دعم شراء
-            elif direction == -1 and dxy_bull: score += 20  # دولار صاعد = دعم بيع
+            if direction == 1 and not dxy_bull: score += 20
+            elif direction == -1 and dxy_bull: score += 20
         
-        # TNX: عائد 10 سنوات
         if tnx is not None:
             tnx_bull = tnx['Close'].iloc[-1] > tnx['Close'].ewm(span=20).mean().iloc[-1]
             if direction == 1 and not tnx_bull: score += 15
             elif direction == -1 and tnx_bull: score += 15
         
-        return max(0, min(100, score + 30))  # Base 30 + bonuses
+        return max(0, min(100, score))
     except:
-        return 30  # Default
+        return 30
 
 async def get_volume_confirmation(df_m15):
     try:
@@ -289,13 +364,15 @@ async def ask_ai_council(data_summary):
     {data_summary}
     1. 🧠 [المحلل الفني]: قدم حجة بناءً على SMC و Hurst.
     2. 📰 [محلل الأخبار]: حلل العناوين، هل تدعم الذهب أم لا؟
-    3. 🏭 [محلل المعادن]: حلل GDX و COT.
-    4. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل.
-    5. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
+    3. 🏭 [محلل المعادن]: حلل GDX.
+    4. 🎲 [محلل مونت كارلو]: حلل الاحتمالية (MC Probability).
+    5. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل.
+    6. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
     الرد:
     🧠 المحلل: [جملة]
     📰 الأخبار: [جملة]
     🏭 المعادن: [جملة]
+    🎲 مونت كارلو: [جملة]
     😈 محامي الشيطان: [جملة]
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة]
     """
@@ -322,10 +399,10 @@ async def ask_ai_council(data_summary):
             response = client.chat.completions.create(model="mistral-small-latest", messages=[{"role": "user", "content": prompt}])
             return response.choices[0].message.content
         except: pass
-    return None  # AI Not Available
+    return None
 
 # ==========================================
-# 🚀 المحرك الرئيسي (مع وعي السياق)
+# 🚀 المحرك الرئيسي (محرك أينشتاين)
 # ==========================================
 async def run_engine():
     try:
@@ -357,7 +434,7 @@ async def run_engine():
                 gdx_trend, gdx_strength = await get_gdx_trend()
                 ctx_score = await get_context_score(0)
                 test_msg = (
-                    f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
+                    f"✅ *البوت خدام مزيان* (وضع الاختبار - محرك أينشتاين)\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 )
@@ -382,7 +459,6 @@ async def run_engine():
             logging.info("GDX Divergence: Sell signal ignored.")
             return None, None
         
-        # ✅ فلتر قوة GDX (إلا كان ضعيف بزاف، ما ندخلوش)
         if abs(gdx_strength) < 0.5:
             logging.info(f"GDX Too Weak: {gdx_strength}%. Ignoring.")
             return None, None
@@ -404,9 +480,46 @@ async def run_engine():
         hurst = calculate_hurst(df_m15['Close'].values)
         macro, vix, intermarket = await get_macro_and_intermarket()
         news_headlines = await get_news_headlines()
+        pain_index = await calculate_pain_index(df_m15, current_price)
 
         atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
         if abs(current_price - entry_zone) > (atr * 2.0):
+            return None, None
+
+        # ✅ حساب الوقف والهدف مع حد أدنى
+        if direction == 1:
+            sl = round(df_m1['Low'].tail(5).min() - (atr * 0.2), 2)
+            risk = entry_zone - sl
+            if risk < 5:
+                risk = 5
+                sl = round(entry_zone - 5, 2)
+            tp1 = round(entry_zone + risk * 2.0, 2)
+            tp2 = round(entry_zone + risk * 4.0, 2)
+            trade_type = "🟢 شراء (Long)"
+        else:
+            sl = round(df_m1['High'].tail(5).max() + (atr * 0.2), 2)
+            risk = sl - entry_zone
+            if risk < 5:
+                risk = 5
+                sl = round(entry_zone + 5, 2)
+            tp1 = round(entry_zone - risk * 2.0, 2)
+            tp2 = round(entry_zone - risk * 4.0, 2)
+            trade_type = "🔴 بيع (Short)"
+
+        if risk <= 0: return None, "❌ خطأ في حساب الوقف"
+
+        # ✅ محاكاة مونت كارلو (Einstein Core)
+        mc_prob = monte_carlo_probability(entry_zone, sl, tp1, atr, direction, simulations=500)
+        logging.info(f"Monte Carlo Probability: {mc_prob*100:.1f}%")
+        
+        # ✅ الفلتر العبقري: إلا كان الاحتمال أقل من 60%، ما ندخلوش
+        if mc_prob < 0.60:
+            logging.info(f"MC Probability too low ({mc_prob*100:.1f}%). Ignoring signal.")
+            return None, None
+
+        # ✅ مؤشر الألم (Pain Index)
+        if pain_index < 50:
+            logging.info(f"Pain Index too low ({pain_index}). Ignoring signal.")
             return None, None
 
         ai_summary = f"""
@@ -418,50 +531,32 @@ async def run_engine():
         VIX: {vix}
         GDX: {gdx_trend} ({gdx_strength}%)
         Context Score: {ctx_score}/100
+        Monte Carlo Probability: {mc_prob*100:.1f}%
+        Pain Index: {pain_index}/100
         Latest News: {news_headlines}
         """
         ai_verdict = await ask_ai_council(ai_summary)
         
-        # ✅ حماية AI: إلا كان غير متاح، ماغاديش نصيفطو الإشارة
         if ai_verdict is None:
             logging.warning("AI Unavailable: Signal blocked for safety.")
             return None, None
 
         if "انتظار" not in ai_verdict:
-            if direction == 1:
-                sl = round(df_m1['Low'].tail(5).min() - (atr * 0.2), 2)
-                risk = entry_zone - sl
-                if risk < 5:  # حد أدنى 5 نقاط
-                    risk = 5
-                    sl = round(entry_zone - 5, 2)
-                tp1 = round(entry_zone + risk * 2.0, 2)
-                tp2 = round(entry_zone + risk * 4.0, 2)
-                trade_type = "🟢 شراء (Long)"
-            else:
-                sl = round(df_m1['High'].tail(5).max() + (atr * 0.2), 2)
-                risk = sl - entry_zone
-                if risk < 5:
-                    risk = 5
-                    sl = round(entry_zone + 5, 2)
-                tp1 = round(entry_zone - risk * 2.0, 2)
-                tp2 = round(entry_zone - risk * 4.0, 2)
-                trade_type = "🔴 بيع (Short)"
-
-            if risk <= 0: return None, "❌ خطأ في حساب الوقف"
-
             signal_hash = f"{direction}_{entry_zone}_{sl}"
             if db_get("last_signal") == signal_hash:
                 return None, None
             db_set("last_signal", signal_hash)
 
             report = (
-                f"👑 *الوحش 67.0 (الوعي بالسياق)*\n"
+                f"👑 *الوحش 68.0 (محرك أينشتاين)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"💰 السعر: `{current_price:.2f}`\n"
                 f"💀 *الضربة الشيطانية:* {sweep_msg}\n"
                 f"🏭 *GDX:* {gdx_trend} ({gdx_strength}%)\n"
                 f"🎯 *Context Score:* {ctx_score}/100\n"
+                f"🎲 *Monte Carlo:* {mc_prob*100:.1f}% احتمال النجاح\n"
+                f"💢 *Pain Index:* {pain_index}/100\n"
                 f"📰 *الأخبار:* {news_headlines[:100]}...\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 *الدخول:* `{entry_zone:.2f}`\n"
