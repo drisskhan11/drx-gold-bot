@@ -7,7 +7,14 @@ import pandas as pd
 import numpy as np
 import telegram
 from openai import OpenAI
-from twelvedata import TDClient
+
+try:
+    from biquote import Biquote
+    bq = Biquote()
+    bq_available = True
+except ImportError:
+    bq_available = False
+    logging.warning("Biquote not installed. Falling back to yfinance only.")
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,11 +28,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
-FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
-
-DB_FILE = "quantum_beast_64.db"
+DB_FILE = "quantum_beast_61.db"
 NY = ZoneInfo("America/New_York")
 SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
 
@@ -34,8 +38,6 @@ try:
     ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception:
     ai_client = None
-
-td = TDClient(apikey=TWELVEDATA_API_KEY) if TWELVEDATA_API_KEY else None
 
 # ==========================================
 # 🗄️ قاعدة البيانات
@@ -67,7 +69,7 @@ async def send_telegram_msg(text):
         logging.error(f"Telegram Error: {e}")
 
 # ==========================================
-# 🌐 جلب البيانات
+# 🌐 جلب البيانات (Biquote + XAUS + yfinance)
 # ==========================================
 async def get_live_prices():
     try:
@@ -75,6 +77,11 @@ async def get_live_prices():
         if d.get("data_state", {}).get("status") == "fresh":
             return float(d["spot_usd_oz"]), float(d["silver_usd_oz"])
     except: pass
+    if bq_available:
+        try:
+            tick = bq.tick("XAUUSD")
+            if tick: return float(tick['mid']), None
+        except: pass
     try:
         gold = yf.Ticker("GC=F").history(period="1d", interval="1m")
         if not gold.empty: return float(gold["Close"].iloc[-1]), None
@@ -82,6 +89,22 @@ async def get_live_prices():
     return None, None
 
 async def fetch_candles(symbol, interval, limit=100):
+    # 1. Biquote
+    if bq_available:
+        try:
+            bq_symbol = "XAUUSD" if symbol == "GC=F" else symbol
+            ohlc = bq.ohlc(bq_symbol, interval=interval, limit=limit)
+            if ohlc and 'bars' in ohlc:
+                df = pd.DataFrame(ohlc['bars'])
+                df['openTime'] = pd.to_datetime(df['openTime'])
+                df = df.set_index('openTime').sort_index()
+                df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                df.index = df.index.tz_localize("UTC").tz_convert(NY) if df.index.tz is None else df.index.tz_convert(NY)
+                return df
+        except Exception as e:
+            logging.warning(f"Biquote failed: {e}")
+
+    # 2. yfinance Fallback
     try:
         yf_interval = "1m" if interval == "1m" else interval
         yf_period = "1d" if interval == "1m" else "5d"
@@ -94,60 +117,16 @@ async def fetch_candles(symbol, interval, limit=100):
     except: pass
     return None
 
-async def get_previous_day_ohlc():
-    if not td: return None
-    try:
-        ts = td.time_series(symbol="XAU/USD", interval="1day", outputsize=10).as_pandas()
-        if ts is None or ts.empty: return None
-        ts.index = pd.to_datetime(ts.index)
-        today = datetime.now(NY).date()
-        past = ts[ts.index.date < today]
-        if past.empty: return None
-        prev = past.iloc[-1]
-        return {
-            "open": float(prev["open"]),
-            "high": float(prev["high"]),
-            "low": float(prev["low"]),
-            "close": float(prev["close"])
-        }
-    except Exception as e:
-        logging.warning(f"Twelve Data failed: {e}")
-        return None
-
-# ==========================================
-# 🏭 تحليل GDX (أسهم التعدين) والأخبار
-# ==========================================
-async def get_gdx_trend():
-    try:
-        gdx = yf.Ticker("GDX").history(period="5d", interval="1h")
-        if gdx.empty: return "NEUTRAL"
-        ema = gdx['Close'].ewm(span=20).mean().iloc[-1]
-        current = gdx['Close'].iloc[-1]
-        return "BULLISH" if current > ema else "BEARISH"
-    except:
-        return "NEUTRAL"
-
-async def get_news_headlines():
-    try:
-        gold = yf.Ticker("GC=F")
-        news = gold.news
-        if not news: return "لا توجد أخبار حديثة."
-        return "\n".join([n.get('title', '') for n in news[:5]])
-    except:
-        return "تعذر جلب الأخبار."
-
 # ==========================================
 # ⏰ فلتر الوقت والأخبار
 # ==========================================
 def is_silver_bullet_time():
-    if FORCE_TEST: return True
     now = datetime.now(NY)
     if now.weekday() >= 5: return False
     t = now.hour + now.minute / 60
     return any(start <= t < end for start, end in SILVER_BULLET_WINDOWS)
 
 def check_news_blackout():
-    if FORCE_TEST: return False, None
     try:
         res = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
         now = datetime.now(NY)
@@ -199,7 +178,7 @@ def detect_judas_swing(df_m15, df_m1, pdh, pdl):
     return None, None, "كنسناو"
 
 # ==========================================
-# 🧠 مؤشرات إضافية والماكرو
+# 🧠 مؤشرات إضافية
 # ==========================================
 def calculate_hurst(prices, max_lag=20):
     try:
@@ -210,33 +189,6 @@ def calculate_hurst(prices, max_lag=20):
         return float(np.polyfit(np.log(lags[m]), np.log(tau[m]), 1)[0]) if m.sum() > 5 else 0.5
     except: return 0.5
 
-async def get_macro_and_intermarket():
-    try:
-        dxy = await fetch_candles("DX-Y.NYB", "1h", 50)
-        vix = await fetch_candles("^VIX", "1h", 50)
-        silver = await fetch_candles("SI=F", "1h", 50)
-        spx = await fetch_candles("^GSPC", "1h", 50)
-
-        macro = "NEUTRAL"
-        if dxy is not None and len(dxy) > 20:
-            dxy_bull = dxy['Close'].iloc[-1] > dxy['Close'].ewm(span=20).mean().iloc[-1]
-            macro = "BEARISH_GOLD" if dxy_bull else "BULLISH_GOLD"
-
-        vix_msg = "غير متاح"
-        if vix is not None:
-            vix_val = vix['Close'].iloc[-1]
-            vix_msg = f"{vix_val:.1f}"
-
-        intermarket = []
-        if silver is not None:
-            intermarket.append(f"🥈 فضة: {silver['Close'].iloc[-1]:.2f}")
-        if spx is not None:
-            intermarket.append(f"📉 S&P: {spx['Close'].iloc[-1]:.2f}")
-
-        return macro, vix_msg, " | ".join(intermarket)
-    except:
-        return "NEUTRAL", "غير متاح", "بيانات غير متاحة"
-
 # ==========================================
 # 🧠 مجلس العباقرة
 # ==========================================
@@ -245,13 +197,11 @@ async def ask_ai_council(data_summary):
     أنت مجلس خبراء تداول (Multi-Agent System).
     المعطيات:
     {data_summary}
-    1. 🧠 [المحلل الفني]: قدم حجة بناءً على المعطيات.
-    2. 📰 [محلل الأخبار]: حلل العناوين المرفقة، هل تدعم الذهب (خطر جيوسياسي) أم لا؟
-    3. 😈 [محامي الشيطان]: هاجم الصفقة! ابحث عن أي سبب للفشل (مثلاً تعارض GDX مع اتجاه الذهب).
-    4. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
+    1. 🧠 [المحلل الفني]: قدم حجة.
+    2. 😈 [محامي الشيطان]: هاجم الصفقة!
+    3. ⚖️ [مدير المخاطر]: القرار النهائي (شراء/بيع/انتظار).
     الرد:
     🧠 المحلل: [جملة]
-    📰 محلل الأخبار: [جملة]
     😈 محامي الشيطان: [جملة]
     ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة]
     """
@@ -281,82 +231,40 @@ async def ask_ai_council(data_summary):
     return "⚠️ AI غير متاح"
 
 # ==========================================
-# 🚀 المحرك الرئيسي (مع فلتر GDX والأخبار)
+# 🚀 المحرك الرئيسي
 # ==========================================
 async def run_engine():
     try:
         if not is_silver_bullet_time():
-            logging.info("💤 ماشي وقت الضربة الشيطانية. البوت ساكت.")
             return None, None
 
         news_blocked, news_msg = check_news_blackout()
         if news_blocked:
-            logging.info(f"⏸️ حظر أخبار: {news_msg}")
             return None, None
 
-        ohlc = await get_previous_day_ohlc()
-        if not ohlc:
-            return None, "❌ تعذر جلب بيانات اليوم السابق"
+        df_m15 = await fetch_candles("GC=F", "15m", 50)
+        df_m1 = await fetch_candles("GC=F", "1m", 50)
+        df_d1 = await fetch_candles("GC=F", "1d", 5)
 
-        pdh, pdl = ohlc["high"], ohlc["low"]
-
-        df_m15 = await fetch_candles("GC=F", "15m", 100)
-        df_m1 = await fetch_candles("GC=F", "1m", 100)
-        if any(d is None for d in [df_m15, df_m1]):
+        if any(d is None or len(d) < 2 for d in [df_m15, df_m1, df_d1]):
             return None, "❌ بيانات غير كافية"
 
+        pdh = df_d1['High'].iloc[-2]
+        pdl = df_d1['Low'].iloc[-2]
         direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
         
         if direction is None:
-            if FORCE_TEST:
-                current_price, _ = await get_live_prices()
-                gdx = await get_gdx_trend()
-                test_msg = (
-                    f"✅ *البوت خدام مزيان* (وضع الاختبار)\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
-                )
-                if current_price:
-                    test_msg += f"💰 السعر الحالي: `{current_price:.2f}`\n"
-                test_msg += (
-                    f"\n📊 *التحليل:*\n"
-                    f"- PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}`\n"
-                    f"- GDX (التعدين): {gdx}\n"
-                    f"\n🧐 *الوضع:* ما كاينش فخ دابا. البوت كينتظر."
-                )
-                return test_msg, None
-            return None, None
-
-        # ✅ فلتر GDX الصارم
-        gdx_trend = await get_gdx_trend()
-        if direction == 1 and gdx_trend == "BEARISH":
-            logging.info("GDX Divergence: Gold Buy signal ignored (GDX Bearish).")
-            return None, None
-        elif direction == -1 and gdx_trend == "BULLISH":
-            logging.info("GDX Divergence: Gold Sell signal ignored (GDX Bullish).")
             return None, None
 
         current_price, _ = await get_live_prices()
         if current_price is None: current_price = df_m1['Close'].iloc[-1]
         hurst = calculate_hurst(df_m15['Close'].values)
-        macro, vix, intermarket = await get_macro_and_intermarket()
-        news_headlines = await get_news_headlines()
 
         atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
         if abs(current_price - entry_zone) > (atr * 2.0):
             return None, None
 
-        # ✅ تمرير الأخبار و GDX لمجلس العباقرة
-        ai_summary = f"""
-        Price: {current_price}
-        Sweep: {sweep_msg}
-        Entry: {entry_zone}
-        Hurst: {hurst}
-        Macro: {macro}
-        VIX: {vix}
-        GDX Trend: {gdx_trend}
-        Latest News: {news_headlines}
-        """
+        ai_summary = f"Price: {current_price}\nSweep: {sweep_msg}\nEntry Zone: {entry_zone}\nHurst: {hurst}"
         ai_verdict = await ask_ai_council(ai_summary)
 
         if "انتظار" not in ai_verdict:
@@ -381,24 +289,22 @@ async def run_engine():
             db_set("last_signal", signal_hash)
 
             report = (
-                f"👑 *الوحش 64.0 (القناص + GDX + AI News)*\n"
+                f"👑 *الوحش 61.0 (الضربة الشيطانية)*\n"
                 f"🕐 الوقت: `{datetime.now(NY).strftime('%H:%M')}` (نيويورك)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 السعر: `{current_price:.2f}`\n"
+                f"💰 السعر الحالي: `{current_price:.2f}`\n"
                 f"💀 *الضربة الشيطانية:* {sweep_msg}\n"
-                f"🏭 *GDX (التعدين):* {gdx_trend}\n"
-                f"📰 *الأخبار:* {news_headlines[:100]}...\n" # Truncated for brevity
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 *الدخول:* `{entry_zone:.2f}`\n"
+                f"🎯 *الدخول (Limit):* `{entry_zone:.2f}`\n"
                 f"{trade_type}\n"
                 f"🛑 *الوقف:* `{sl:.2f}`\n"
-                f"🏆 *الهدف 1:* `{tp1:.2f}`\n"
-                f"🚀 *الهدف 2:* `{tp2:.2f}`\n"
+                f"🏆 *الهدف 1 (1:2):* `{tp1:.2f}`\n"
+                f"🚀 *الهدف 2 (1:4):* `{tp2:.2f}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🧠 *مجلس العباقرة:*\n{ai_verdict}\n"
             )
             return report, None
-
+            
         return None, None
 
     except Exception as e:
