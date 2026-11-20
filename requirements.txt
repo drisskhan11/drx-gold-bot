@@ -6,5 +6,7 @@ requests
 google-genai
 openai
 twelvedata
-scipy
-biquote
+hmmlearn
+transformers
+torch
+stable-baselines3
