@@ -44,7 +44,7 @@ RISK_PER_TRADE_PCT = float(os.environ.get("RISK_PER_TRADE_PCT", "1.0"))
 MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "3.0"))
 CONTRACT_SIZE = float(os.environ.get("CONTRACT_SIZE", "100.0"))
 
-DB_FILE = os.environ.get("DB_FILE", "quantum_beast_66.db")
+DB_FILE = os.environ.get("DB_FILE", "quantum_beast_67.db")
 NY = ZoneInfo("America/New_York")
 
 SILVER_BULLET_WINDOWS = [
@@ -211,13 +211,11 @@ def build_daily_summary(day_str: str) -> str:
 
     est_pnl = 0.0
     for direction, entry, sl, tp1, tp2, lot, status in rows:
-        d = int(direction)
         e, s, t1, t2 = float(entry), float(sl), float(tp1), float(tp2)
         l = float(lot) if is_valid_num(lot) else 0.01
         if status == "SL_HIT":
             est_pnl -= abs(e - s) * l * CONTRACT_SIZE
         elif status == "TP1_HIT":
-            # نصف الصفقة على TP1 والباقي على BE
             est_pnl += abs(t1 - e) * (l * 0.5) * CONTRACT_SIZE
         elif status == "TP2_HIT":
             est_pnl += (abs(t1 - e) * 0.5 + abs(t2 - e) * 0.5) * l * CONTRACT_SIZE
@@ -272,52 +270,64 @@ async def send_telegram_msg(text: str):
 
 
 # ==========================================
-# 🌐 جلب البيانات (متعدد المصادر + Retry)
+# 🌐 جلب البيانات (مصدر موحد لتجنب فرق الأسعار)
 # ==========================================
-async def get_live_prices():
-    # 1. XAUS API
+async def fetch_candles_twelvedata(symbol: str, interval: str, limit: int = 120):
+    if not td:
+        return None
+    td_interval_map = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1day",
+    }
+    td_iv = td_interval_map.get(interval, interval)
+
+    def _td_fetch():
+        ts = td.time_series(symbol=symbol, interval=td_iv, outputsize=min(limit + 15, 300)).as_pandas()
+        if ts is None or ts.empty:
+            return None
+        df = ts.copy().sort_index()
+        rename_map = {
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+        df = df.rename(columns=rename_map)
+        for c in ["Open", "High", "Low", "Close"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        if "Volume" in df.columns:
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
+        else:
+            df["Volume"] = 0.0
+
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        df = df[(df["High"] > 0) & (df["Low"] > 0) & (df["Close"] > 0)]
+        if df.empty:
+            return None
+
+        idx = pd.to_datetime(df.index)
+        df.index = (idx.tz_localize("UTC") if idx.tz is None else idx).tz_convert(NY)
+        return df.tail(limit)
+
     try:
-        async def _xaus():
-            async with httpx.AsyncClient(timeout=7.0) as client:
-                r = await client.get("https://xaus.com/api/v1/spot?compact=1")
-                r.raise_for_status()
-                return r.json()
-
-        d = await retry_async(_xaus, retries=2, base_delay=0.5, label="xaus_spot")
-        if d.get("data_state", {}).get("status") == "fresh":
-            gold = float(d["spot_usd_oz"])
-            silver_raw = d.get("silver_usd_oz")
-            silver = float(silver_raw) if is_valid_num(silver_raw) else None
-            if is_valid_num(gold):
-                return gold, silver
-    except Exception as e:
-        logger.debug(f"XAUS spot fallback: {e}")
-
-    # 2. yfinance GC=F
-    try:
-        def _yf_spot():
-            df = yf.Ticker("GC=F").history(period="1d", interval="1m", auto_adjust=False)
-            if df is None or df.empty:
-                return None
-            last_val = float(df["Close"].dropna().iloc[-1])
-            return last_val if is_valid_num(last_val) else None
-
-        gold_price = await retry_async(
-            lambda: asyncio.to_thread(_yf_spot),
+        return await retry_async(
+            lambda: asyncio.to_thread(_td_fetch),
             retries=2,
             base_delay=0.6,
-            label="yf_spot"
+            label=f"td_{symbol}_{td_iv}"
         )
-        if gold_price:
-            return gold_price, None
     except Exception as e:
-        logger.debug(f"yfinance spot fallback: {e}")
+        logger.debug(f"TwelveData fetch failed ({symbol}, {interval}): {e}")
+        return None
 
-    return None, None
 
-
-async def fetch_candles(symbol: str, interval: str, limit: int = 120):
-    def _download():
+async def fetch_candles_yfinance(symbol: str, interval: str, limit: int = 120):
+    def _yf_fetch():
         yf_symbol = "GC=F" if symbol in ("XAUUSD", "XAU/USD", "GC=F") else symbol
         period_map = {
             "1m": "2d",
@@ -333,6 +343,8 @@ async def fetch_candles(symbol: str, interval: str, limit: int = 120):
             return None
         cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
         df = df[cols].dropna()
+        if "Volume" not in df.columns:
+            df["Volume"] = 0.0
         df = df[(df["High"] > 0) & (df["Low"] > 0) & (df["Close"] > 0)]
         if df.empty:
             return None
@@ -341,57 +353,101 @@ async def fetch_candles(symbol: str, interval: str, limit: int = 120):
 
     try:
         return await retry_async(
-            lambda: asyncio.to_thread(_download),
+            lambda: asyncio.to_thread(_yf_fetch),
             retries=2,
             base_delay=0.6,
-            label=f"candles_{symbol}_{interval}"
+            label=f"yf_{symbol}_{interval}"
         )
     except Exception as e:
-        logger.warning(f"fetch_candles error ({symbol}, {interval}): {e}")
+        logger.warning(f"yfinance fetch failed ({symbol}, {interval}): {e}")
         return None
 
 
-async def get_previous_day_ohlc():
+async def fetch_candles(symbol: str, interval: str, limit: int = 120, source_hint: str | None = None):
+    if symbol in ("XAUUSD", "XAU/USD", "GC=F"):
+        if source_hint == "yfinance":
+            return await fetch_candles_yfinance("GC=F", interval, limit)
+        if source_hint == "twelvedata":
+            return await fetch_candles_twelvedata("XAU/USD", interval, limit)
+
+        # تلقائي: نحاولو TwelveData أولاً (XAU/USD)، وإذا فشل نرجعو لـ yfinance (GC=F)
+        df_td = await fetch_candles_twelvedata("XAU/USD", interval, limit)
+        if df_td is not None and not df_td.empty:
+            return df_td
+        return await fetch_candles_yfinance("GC=F", interval, limit)
+
+    return await fetch_candles_yfinance(symbol, interval, limit)
+
+
+async def get_unified_gold_market_data():
+    """
+    يجلب السعر الحالي، PDH/PDL، وشموع 1m / 15m / 1h من نفس المصدر الموحد
+    لتفادي أي اختلاف في الأسعار بين السبوت والعقود الآجلة.
+    """
     today = datetime.now(NY).date()
 
+    # 1. محاولة المصدر الأساسي الموحد: TwelveData (XAU/USD)
     if td:
-        try:
-            def _td_daily():
-                ts = td.time_series(symbol="XAU/USD", interval="1day", outputsize=10).as_pandas()
-                if ts is None or ts.empty:
-                    return None
-                ts = ts.copy()
-                ts.index = pd.to_datetime(ts.index)
-                past = ts[ts.index.date < today].sort_index()
-                if past.empty:
-                    return None
-                prev = past.iloc[-1]
-                h, l, o, c = float(prev["high"]), float(prev["low"]), float(prev["open"]), float(prev["close"])
-                if not all(is_valid_num(x) for x in (h, l, o, c)) or h < l:
-                    return None
-                return {"open": o, "high": h, "low": l, "close": c, "source": "TwelveData"}
+        df_1m_td, df_15m_td, df_1h_td, df_1d_td = await asyncio.gather(
+            fetch_candles_twelvedata("XAU/USD", "1m", limit=120),
+            fetch_candles_twelvedata("XAU/USD", "15m", limit=120),
+            fetch_candles_twelvedata("XAU/USD", "1h", limit=120),
+            fetch_candles_twelvedata("XAU/USD", "1d", limit=15),
+        )
+        if df_1m_td is not None and df_15m_td is not None and df_1d_td is not None:
+            past_d = df_1d_td[df_1d_td.index.date < today]
+            if not past_d.empty:
+                prev = past_d.iloc[-1]
+                h, l, o, c = float(prev["High"]), float(prev["Low"]), float(prev["Open"]), float(prev["Close"])
+                if all(is_valid_num(x) for x in (h, l, o, c)) and h >= l:
+                    spot_price = float(df_1m_td["Close"].iloc[-1])
+                    return {
+                        "source": "TwelveData (XAU/USD)",
+                        "price": spot_price,
+                        "ohlc": {"open": o, "high": h, "low": l, "close": c, "source": "TwelveData"},
+                        "df_m1": df_1m_td,
+                        "df_m15": df_15m_td,
+                        "df_h1": df_1h_td,
+                    }
 
-            res = await retry_async(
-                lambda: asyncio.to_thread(_td_daily),
-                retries=2,
-                base_delay=0.6,
-                label="td_daily"
-            )
-            if res:
-                return res
-        except Exception as e:
-            logger.warning(f"Twelve Data failed: {e}")
-
-    df_d = await fetch_candles("GC=F", "1d", limit=15)
-    if df_d is not None and not df_d.empty:
-        past = df_d[df_d.index.date < today]
-        if not past.empty:
-            prev = past.iloc[-1]
+    # 2. احتياطي موحد: yfinance (GC=F)
+    df_1m_yf, df_15m_yf, df_1h_yf, df_1d_yf = await asyncio.gather(
+        fetch_candles_yfinance("GC=F", "1m", limit=120),
+        fetch_candles_yfinance("GC=F", "15m", limit=120),
+        fetch_candles_yfinance("GC=F", "1h", limit=120),
+        fetch_candles_yfinance("GC=F", "1d", limit=15),
+    )
+    if df_1m_yf is not None and df_15m_yf is not None and df_1d_yf is not None:
+        past_d = df_1d_yf[df_1d_yf.index.date < today]
+        if not past_d.empty:
+            prev = past_d.iloc[-1]
             h, l, o, c = float(prev["High"]), float(prev["Low"]), float(prev["Open"]), float(prev["Close"])
             if all(is_valid_num(x) for x in (h, l, o, c)) and h >= l:
-                return {"open": o, "high": h, "low": l, "close": c, "source": "yfinance"}
+                spot_price = float(df_1m_yf["Close"].iloc[-1])
+                return {
+                    "source": "yfinance (GC=F)",
+                    "price": spot_price,
+                    "ohlc": {"open": o, "high": h, "low": l, "close": c, "source": "yfinance"},
+                    "df_m1": df_1m_yf,
+                    "df_m15": df_15m_yf,
+                    "df_h1": df_1h_yf,
+                }
 
     return None
+
+
+async def get_live_prices():
+    market = await get_unified_gold_market_data()
+    gold_price = market["price"] if market and is_valid_num(market.get("price")) else None
+
+    silver_price = None
+    df_sil = await fetch_candles_yfinance("SI=F", "1h", limit=5)
+    if df_sil is not None and not df_sil.empty:
+        s_val = float(df_sil["Close"].iloc[-1])
+        if is_valid_num(s_val):
+            silver_price = s_val
+
+    return gold_price, silver_price
 
 
 # ==========================================
@@ -422,7 +478,7 @@ async def monitor_signals(current_price: float | None):
         new_status = None
         msg = None
 
-        if d == 1:  # شراء
+        if d == 1:
             if status == "PENDING":
                 if current_price <= e:
                     new_status = "ACTIVE"
@@ -448,7 +504,7 @@ async def monitor_signals(current_price: float | None):
                     new_status = "BE_CLOSED"
                     msg = f"🛡️ *الصفقة #{sig_id} (شراء)* أُغلقت على *Break-Even* بعد تأمين الهدف 1."
 
-        elif d == -1:  # بيع
+        elif d == -1:
             if status == "PENDING":
                 if current_price >= e:
                     new_status = "ACTIVE"
@@ -509,7 +565,6 @@ def should_send_hourly_report(now: datetime) -> bool:
 
 
 def should_send_eod_report(now: datetime) -> bool:
-    # إرسال ملخص نهاية الجلسة عند الساعة 17:00-17:05 بتوقيت نيويورك أيام العمل
     if now.weekday() >= 5:
         return False
     if now.hour == 17 and now.minute <= 5:
@@ -551,7 +606,7 @@ async def check_news_blackout():
 
 
 # ==========================================
-# 💀 كشف الفخ (Judas Swing) + CHoCH + FVG + التقييم
+# 💀 كشف الفخ (PDH/PDL + سيولة الجلسة) + CHoCH + FVG
 # ==========================================
 def detect_fvg(df: pd.DataFrame, direction: int, lookback: int = 8):
     if df is None or len(df) < 4:
@@ -587,41 +642,63 @@ def get_htf_bias(df_h1: pd.DataFrame) -> str:
 
 
 def detect_judas_swing(df_m15: pd.DataFrame, df_m1: pd.DataFrame, pdh: float, pdl: float):
-    if df_m15 is None or df_m1 is None or len(df_m15) < 6 or len(df_m1) < 12:
+    """
+    يكتشف كنس السيولة (Sweep) إما على PDH/PDL أو على قمة/قاع الجلسة الأخيرة (آخر 24 شمعة M15 = 6 ساعات)
+    متبوعاً بتغير الهيكل (CHoCH) على فريم الدقيقة وتشكّل FVG.
+    """
+    if df_m15 is None or df_m1 is None or len(df_m15) < 10 or len(df_m1) < 12:
         return None, None, None, "بيانات غير كافية"
 
+    # نطاق السيولة اليومي (PDH/PDL) + نطاق الجلسة (آخر 24 شمعة M15 باستثناء آخر شمعتين)
+    session_slice = df_m15.iloc[-26:-2] if len(df_m15) >= 26 else df_m15.iloc[:-2]
+    sess_high = float(session_slice["High"].max()) if not session_slice.empty else pdh
+    sess_low = float(session_slice["Low"].min()) if not session_slice.empty else pdl
+
     recent_m15 = df_m15.tail(6)
-    swept_high = float(recent_m15["High"].max()) > pdh
-    swept_low = float(recent_m15["Low"].min()) < pdl
+    rec_high = float(recent_m15["High"].max())
+    rec_low = float(recent_m15["Low"].min())
+
+    swept_pdh = rec_high > pdh
+    swept_pdl = rec_low < pdl
+    swept_sess_high = rec_high > sess_high and sess_high < pdh
+    swept_sess_low = rec_low < sess_low and sess_low > pdl
+
+    swept_high = swept_pdh or swept_sess_high
+    swept_low = swept_pdh is False and (swept_pdl or swept_sess_low)
 
     last_m1 = df_m1.tail(12)
     last_close = float(last_m1["Close"].iloc[-1])
 
     if swept_high and not swept_low:
+        level_label = f"PDH ({pdh:.2f})" if swept_pdh else f"Session High ({sess_high:.2f})"
         swing_low = float(last_m1["Low"].iloc[-6:-1].min())
         if last_close < swing_low:
             fvg = detect_fvg(df_m1, -1, lookback=8)
             if fvg:
                 entry = round((fvg[0] + fvg[1]) / 2.0, 2)
-                return -1, entry, fvg, f"🔴 فخ فوق PDH ({pdh:.2f}) + CHoCH هبوطي + FVG"
+                return -1, entry, fvg, f"🔴 فخ فوق {level_label} + CHoCH هبوطي + FVG"
             fallback_entry = round(float(last_m1["High"].iloc[-4:-1].max()), 2)
-            return -1, fallback_entry, None, f"🔴 فخ فوق PDH ({pdh:.2f}) + CHoCH هبوطي"
+            return -1, fallback_entry, None, f"🔴 فخ فوق {level_label} + CHoCH هبوطي"
 
     if swept_low and not swept_high:
+        level_label = f"PDL ({pdl:.2f})" if swept_pdl else f"Session Low ({sess_low:.2f})"
         swing_high = float(last_m1["High"].iloc[-6:-1].max())
         if last_close > swing_high:
             fvg = detect_fvg(df_m1, 1, lookback=8)
             if fvg:
                 entry = round((fvg[0] + fvg[1]) / 2.0, 2)
-                return 1, entry, fvg, f"🟢 فخ تحت PDL ({pdl:.2f}) + CHoCH صعودي + FVG"
+                return 1, entry, fvg, f"🟢 فخ تحت {level_label} + CHoCH صعودي + FVG"
             fallback_entry = round(float(last_m1["Low"].iloc[-4:-1].min()), 2)
-            return 1, fallback_entry, None, f"🟢 فخ تحت PDL ({pdl:.2f}) + CHoCH صعودي"
+            return 1, fallback_entry, None, f"🟢 فخ تحت {level_label} + CHoCH صعودي"
 
-    return None, None, None, "في الانتظار (لا يوجد Sweep + CHoCH مؤكد)"
+    status_txt = (
+        f"في الانتظار | Session Range: `{sess_low:.2f} - {sess_high:.2f}`"
+    )
+    return None, None, None, status_txt
 
 
 def compute_confluence_score(direction: int, fvg, htf_bias: str, macro: str, hurst: float) -> int:
-    score = 45  # أساس تحقق Sweep + CHoCH
+    score = 45
     if fvg is not None:
         score += 15
     if direction == 1 and htf_bias == "BULLISH":
@@ -685,10 +762,10 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
 
 async def get_macro_and_intermarket():
     dxy, vix, silver, spx = await asyncio.gather(
-        fetch_candles("DX-Y.NYB", "1h", 50),
-        fetch_candles("^VIX", "1h", 50),
-        fetch_candles("SI=F", "1h", 50),
-        fetch_candles("^GSPC", "1h", 50),
+        fetch_candles_yfinance("DX-Y.NYB", "1h", 50),
+        fetch_candles_yfinance("^VIX", "1h", 50),
+        fetch_candles_yfinance("SI=F", "1h", 50),
+        fetch_candles_yfinance("^GSPC", "1h", 50),
     )
 
     macro = "NEUTRAL"
@@ -804,20 +881,26 @@ async def ask_ai_council(data_summary: str) -> str:
 
 
 # ==========================================
-# 🚀 المحرك الرئيسي (Market Sovereign)
+# 🚀 المحرك الرئيسي (Market Sovereign v67)
 # ==========================================
 async def run_engine():
     now = datetime.now(NY)
     today_str = now.strftime("%Y-%m-%d")
 
-    current_price, silver_price = await get_live_prices()
+    market = await get_unified_gold_market_data()
+    current_price = market["price"] if market else None
+
+    silver_price = None
+    df_sil = await fetch_candles_yfinance("SI=F", "1h", limit=5)
+    if df_sil is not None and not df_sil.empty and is_valid_num(df_sil["Close"].iloc[-1]):
+        silver_price = float(df_sil["Close"].iloc[-1])
 
     # 1. متابعة الصفقات المعلقة والنشطة
     trade_alerts = await monitor_signals(current_price)
     for alert_msg in trade_alerts:
         await send_telegram_msg(alert_msg)
 
-    # 2. ملخص نهاية الجلسة إذا حان وقته
+    # 2. ملخص نهاية الجلسة عند 17:00 NY
     if should_send_eod_report(now):
         await send_telegram_msg(build_daily_summary(today_str))
 
@@ -838,7 +921,7 @@ async def run_engine():
                 f"━━━━━━━━━━━━━━━━━━━━\n"
             )
             if is_valid_num(current_price):
-                report += f"💰 الذهب الفوري: `{current_price:.2f}`\n"
+                report += f"💰 الذهب ({market['source']}): `{current_price:.2f}`\n"
             if is_valid_num(silver_price):
                 report += f"🥈 الفضة الفورية: `{silver_price:.2f}`\n"
             report += (
@@ -862,16 +945,14 @@ async def run_engine():
         logger.info(news_msg)
         return None, None
 
-    # 6. جلب قمم/قيعان اليوم السابق والشموع
-    ohlc, df_m15, df_m1, df_h1 = await asyncio.gather(
-        get_previous_day_ohlc(),
-        fetch_candles("GC=F", "15m", limit=120),
-        fetch_candles("GC=F", "1m", limit=120),
-        fetch_candles("GC=F", "1h", limit=120),
-    )
+    # 6. التحقق من بيانات السوق الموحدة
+    if not market:
+        return None, "❌ تعذر جلب بيانات الذهب الموحدة (السعر + PDH/PDL + الشموع)"
 
-    if not ohlc:
-        return None, "❌ تعذر جلب بيانات اليوم السابق (PDH/PDL)"
+    ohlc = market["ohlc"]
+    df_m15 = market["df_m15"]
+    df_m1 = market["df_m1"]
+    df_h1 = market["df_h1"]
 
     if df_m15 is None or df_m1 is None or len(df_m15) < 20 or len(df_m1) < 15:
         return None, "❌ بيانات غير كافية للتحليل (M15/M1)"
@@ -883,15 +964,15 @@ async def run_engine():
     if direction is None:
         if FORCE_TEST:
             test_msg = (
-                f"✅ *الوحش 66.0 جاهز وحاكم للمسار* (FORCE_TEST)\n"
+                f"✅ *الوحش 67.0 جاهز وموحد المصادر* (FORCE_TEST)\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🕐 الوقت: `{now.strftime('%H:%M')}` (نيويورك)\n"
             )
             if is_valid_num(current_price):
-                test_msg += f"💰 السعر الحالي: `{current_price:.2f}`\n"
+                test_msg += f"💰 السعر الحالي ({market['source']}): `{current_price:.2f}`\n"
             test_msg += (
                 f"\n📊 *المعطيات الحالية:*\n"
-                f"- PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}` ({ohlc.get('source')})\n"
+                f"- PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}`\n"
                 f"- اتجاه H1: `{htf_bias}`\n"
                 f"- حالة الكشف: {sweep_msg}\n"
                 f"- عتبة الجودة المطلوبة: `{MIN_CONFLUENCE_SCORE}/100`\n"
@@ -945,6 +1026,7 @@ async def run_engine():
     fvg_text = f"`{fvg[0]:.2f} - {fvg[1]:.2f}`" if fvg else "غير متوفر"
 
     ai_summary = (
+        f"Source: {market['source']}\n"
         f"Current Price: {current_price:.2f}\n"
         f"Setup: {sweep_msg}\n"
         f"Confluence Score: {score}/100\n"
@@ -978,10 +1060,10 @@ async def run_engine():
     )
 
     report = (
-        f"👑 *الوحش 66.0 (حاكم المارشي) — إشارة #{sig_id}*\n"
+        f"👑 *الوحش 67.0 (حاكم المارشي) — إشارة #{sig_id}*\n"
         f"🕐 الوقت: `{now.strftime('%H:%M')}` (نيويورك) | *الجودة: `{score}/100`*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 السعر الحالي: `{current_price:.2f}`\n"
+        f"💰 السعر ({market['source']}): `{current_price:.2f}`\n"
         f"💀 *الإعداد:* {sweep_msg}\n"
         f"📦 *منطقة FVG:* {fvg_text}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
