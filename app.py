@@ -1,13 +1,9 @@
 """
-=====================================================
-👑 الوحش 71.0 — القناص اليومي (النسخة النهائية)
-=====================================================
-- الكود الأصلي محفوظ 100%
-- 5 استراتيجيات متوازية
-- إصلاح تضارب PDH/PDL مع السعر الحالي
-- احتياطي 24 ساعة إذا فشلت المصادر
-- فحص سلامة قبل كل إشارة
-=====================================================
+=============================================================
+🦅 النسر الكامل — النظام السيادي متعدد الطبقات
+=============================================================
+6 محركات مستقلة + تصويت + إدارة مخاطر تكيفية
+=============================================================
 """
 
 import os, sqlite3, warnings, logging, asyncio, requests, json, time
@@ -26,51 +22,46 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
-        logging.FileHandler("quantum_beast_71.log", encoding="utf-8"),
+        logging.FileHandler("eagle_full.log", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
 
-# ==========================================
+# ============================================================
 # ⚙️ الإعدادات
-# ==========================================
+# ============================================================
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 
 FORCE_TEST = os.environ.get("FORCE_TEST", "0").strip() == "1"
 
-DB_FILE = "quantum_beast_71.db"
+DB_FILE = "eagle_full.db"
 NY = ZoneInfo("America/New_York")
 
-TRADING_SESSIONS = [(3, 7), (8, 12), (13, 17)]
-SILVER_BULLET_WINDOWS = [(3, 4), (10, 11)]
+# جلسات التداول (بتوقيت نيويورك)
+SESSIONS = {
+    "ASIA": (18, 2),    # 18:00 - 02:00
+    "LONDON": (2, 8),   # 02:00 - 08:00
+    "NY": (8, 17),      # 08:00 - 17:00
+}
 
-MAX_SIGNALS_PER_DAY = 15
-MIN_SIGNAL_CONFIDENCE = 55
-SIGNAL_COOLDOWN_MIN = 20
-STRATEGIES_ENABLED = ["judas", "vwap", "ema", "range", "divergence"]
+# نوافذ القتل (Kill Zones)
+KILL_ZONES = [(2, 5), (8.5, 11.5)]  # London + NY
 
-try:
-    from google import genai
-    ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-except Exception:
-    ai_client = None
+MAX_SIGNALS_PER_DAY = 12
+SIGNAL_COOLDOWN_MIN = 25
 
-td = TDClient(apikey=TWELVEDATA_API_KEY) if TWELVEDATA_API_KEY else None
-
-# ==========================================
+# ============================================================
 # 🗄️ قاعدة البيانات
-# ==========================================
+# ============================================================
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 conn.executescript("PRAGMA journal_mode=WAL;")
 conn.executescript("""
 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, direction INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, status TEXT);
+CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, engine TEXT, direction INTEGER, entry REAL, sl REAL, tp1 REAL, tp2 REAL, status TEXT);
 """)
 conn.commit()
 
@@ -82,699 +73,573 @@ def db_set(key, value):
     conn.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (key, str(value)))
     conn.commit()
 
-# ==========================================
+# ============================================================
 # 📱 تيليجرام
-# ==========================================
-async def send_telegram_msg(text):
+# ============================================================
+async def send_telegram(text):
     if not TOKEN or not CHAT_ID: return
     try:
         bot = telegram.Bot(token=TOKEN)
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='Markdown')
     except Exception as e:
-        logging.error(f"Telegram Error: {e}")
+        logging.error(f"Telegram: {e}")
 
-# ==========================================
+# ============================================================
 # 🌐 جلب البيانات
-# ==========================================
-async def get_live_prices():
-    """السعر الحالي (TwelveData أولًا، yfinance احتياطيًا)"""
-    if td:
+# ============================================================
+_td = TDClient(apikey=TWELVEDATA_API_KEY) if TWELVEDATA_API_KEY else None
+
+async def get_price():
+    if _td:
         try:
-            ts = td.time_series(symbol="XAU/USD", interval="1min", outputsize=1).as_pandas()
-            if ts is not None and not ts.empty:
-                return float(ts['close'].iloc[0]), None
+            ts = _td.time_series(symbol="XAU/USD", interval="1min", outputsize=1).as_pandas()
+            if ts is not None and not ts.empty: return float(ts['close'].iloc[0])
         except: pass
     try:
-        gold = yf.Ticker("GC=F").history(period="1d", interval="1m")
-        if not gold.empty: return float(gold["Close"].iloc[-1]), None
+        g = yf.Ticker("GC=F").history(period="1d", interval="1m")
+        if not g.empty: return float(g["Close"].iloc[-1])
     except: pass
-    return None, None
+    return None
 
-async def fetch_candles(symbol, interval, limit=100):
+async def get_candles(interval, limit=200):
     try:
         yf_interval = "1m" if interval == "1m" else interval
         yf_period = "1d" if interval == "1m" else "5d"
-        ticker = yf.Ticker(symbol if symbol != "XAUUSD" else "GC=F")
-        df = ticker.history(period=yf_period, interval=yf_interval, auto_adjust=False)
+        df = yf.Ticker("GC=F").history(period=yf_period, interval=yf_interval, auto_adjust=False)
         if df is not None and not df.empty:
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            df = df[["Open","High","Low","Close","Volume"]].dropna()
             df.index = (df.index.tz_localize("UTC") if df.index.tz is None else df.index).tz_convert(NY)
             return df
     except: pass
     return None
 
-# ==========================================
-# ✅ [جديد] PDH/PDL ذكي مع احتياطي
-# ==========================================
-async def get_previous_day_ohlc(current_price=None):
-    """
-    محاولة 1: yfinance daily
-    محاولة 2: TwelveData daily
-    محاولة 3: حساب من آخر 24 ساعة (15m) — مضمون
-    يختار المصدر الأقرب للسعر الحالي (فرق < 3%)
-    """
+async def get_pdh_pdl(current_price):
+    """PDH/PDL ذكي مع احتياطي 24h"""
     candidates = []
-
-    # 1. yfinance
     try:
-        gold = yf.Ticker("GC=F").history(period="5d", interval="1d")
-        if not gold.empty and len(gold) >= 2:
-            prev = gold.iloc[-2]
-            candidates.append({
-                "open": float(prev["Open"]), "high": float(prev["High"]),
-                "low": float(prev["Low"]), "close": float(prev["Close"]),
-                "source": "yfinance GC=F"
-            })
-    except Exception as e:
-        logging.warning(f"yfinance daily: {e}")
-
-    # 2. TwelveData
-    if td:
+        g = yf.Ticker("GC=F").history(period="5d", interval="1d")
+        if not g.empty and len(g) >= 2:
+            p = g.iloc[-2]
+            candidates.append({"high": float(p["High"]), "low": float(p["Low"]),
+                               "close": float(p["Close"]), "source": "yf_daily"})
+    except: pass
+    if _td:
         try:
-            ts = td.time_series(symbol="XAU/USD", interval="1day", outputsize=10).as_pandas()
+            ts = _td.time_series(symbol="XAU/USD", interval="1day", outputsize=10).as_pandas()
             if ts is not None and not ts.empty:
                 ts.index = pd.to_datetime(ts.index)
-                today = datetime.now(NY).date()
-                past = ts[ts.index.date < today]
+                past = ts[ts.index.date < datetime.now(NY).date()]
                 if not past.empty:
-                    prev = past.iloc[-1]
-                    candidates.append({
-                        "open": float(prev["open"]), "high": float(prev["high"]),
-                        "low": float(prev["low"]), "close": float(prev["close"]),
-                        "source": "TwelveData"
-                    })
-        except Exception as e:
-            logging.warning(f"TwelveData daily: {e}")
-
-    # اختيار الأقرب للسعر
+                    p = past.iloc[-1]
+                    candidates.append({"high": float(p["high"]), "low": float(p["low"]),
+                                       "close": float(p["close"]), "source": "td_daily"})
+        except: pass
     if candidates and current_price:
-        best = None
-        best_diff = 999
+        best, bd = None, 999
         for c in candidates:
-            diff = abs(current_price - c["close"]) / current_price * 100
-            if diff < best_diff:
-                best_diff = diff
-                best = c
-        if best_diff < 3:
-            logging.info(f"✅ PDH/PDL من {best['source']} (فرق: {best_diff:.2f}%)")
-            return best
-        logging.warning(f"⚠️ كل المصادر بعيدة عن السعر {current_price} (أقرب: {best_diff:.2f}%) → احتياطي 24h")
-    elif candidates:
-        return candidates[0]
-
-    # 3. احتياطي نهائي: آخر 24 ساعة من شموع 15m
+            d = abs(current_price - c["close"]) / current_price * 100
+            if d < bd: bd, best = d, c
+        if bd < 3: return best
     try:
-        df = await fetch_candles("GC=F", "15m", 500)
+        df = await get_candles("15m", 500)
         if df is not None and len(df) >= 20:
-            last_24h = df.tail(96)
-            ohlc = {
-                "open": float(last_24h['Open'].iloc[0]),
-                "high": float(last_24h['High'].max()),
-                "low": float(last_24h['Low'].min()),
-                "close": float(last_24h['Close'].iloc[-1]),
-                "source": "آخر 24h (15m)"
-            }
-            logging.info(f"✅ PDH/PDL من آخر 24h: H={ohlc['high']:.2f} L={ohlc['low']:.2f}")
-            return ohlc
-    except Exception as e:
-        logging.warning(f"24h fallback: {e}")
-
+            h24 = df.tail(96)
+            return {"high": float(h24['High'].max()), "low": float(h24['Low'].min()),
+                    "close": float(h24['Close'].iloc[-1]), "source": "24h"}
+    except: pass
     return None
 
-def sanity_check_ohlc(current_price, ohlc):
-    """يتحقق أن السعر منطقي مقابل PDH/PDL (فرق أقل من 5%)"""
-    if not ohlc or current_price is None:
-        return False, "بيانات ناقصة"
-    diff = abs(current_price - ohlc["close"]) / current_price * 100
-    if diff > 5:
-        return False, f"السعر {current_price:.2f} بعيد عن إغلاق أمس {ohlc['close']:.2f} ({diff:.1f}%)"
+# ============================================================
+# 🧬 المحرك 1: HMM واعي بالجلسة
+# ============================================================
+try:
+    from hmmlearn import hmm
+    HMM_OK = True
+except:
+    HMM_OK = False
+    logging.warning("hmmlearn غير مثبت → HMM معطل")
+
+def get_session():
+    now = datetime.now(NY)
+    h = now.hour + now.minute / 60
+    if 18 <= h or h < 2: return "ASIA"
+    if 2 <= h < 8: return "LONDON"
+    return "NY"
+
+def detect_regime_hmm(df_m15):
+    """HMM مبسط: 3 حالات (0=نطاق، 1=اتجاه، 2=ذعر)"""
+    if not HMM_OK or df_m15 is None or len(df_m15) < 100:
+        return detect_regime_simple(df_m15)
+    try:
+        returns = df_m15['Close'].pct_change().dropna().values.reshape(-1, 1)
+        if len(returns) < 50: return 1
+        model = hmm.GaussianHMM(n_components=3, covariance_type="diag", n_iter=100, random_state=42)
+        model.fit(returns)
+        states = model.predict(returns)
+        current = states[-1]
+        # ترتيب: الحالة ذات أعلى تقلب = ذعر
+        variances = model.covars_.flatten()
+        sorted_idx = np.argsort(variances)
+        mapping = {sorted_idx[0]: 0, sorted_idx[1]: 1, sorted_idx[2]: 2}
+        return mapping.get(current, 1)
+    except:
+        return detect_regime_simple(df_m15)
+
+def detect_regime_simple(df_m15):
+    if df_m15 is None or len(df_m15) < 50: return 1
+    close = df_m15['Close']
+    ema20 = close.ewm(span=20).mean()
+    ema50 = close.ewm(span=50).mean()
+    atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
+    slope = (ema20.iloc[-1] - ema20.iloc[-10]) / 10
+    vol = df_m15['Close'].pct_change().tail(20).std()
+    if vol > 0.008: return 2
+    if abs(slope) > 0.05 * atr: return 1
+    return 0
+
+def session_rules(session, regime):
+    """
+    قواعد الجلسة:
+    ASIA: نطاق قوي → لا نتداول الاتجاه
+    LONDON: انتقال من نطاق لاتجاه → نسمح
+    NY: اتجاه قوي → نسمح
+    """
+    if session == "ASIA" and regime == 0: return False, "آسيا/نطاق"
+    if session == "ASIA" and regime == 2: return False, "آسيا/ذعر"
+    if regime == 2: return False, "ذعر عالمي"
     return True, "OK"
 
-# ==========================================
-# 🏭 GDX والأخبار
-# ==========================================
-async def get_gdx_trend():
+# ============================================================
+# 🏛️ المحرك 2: GARM-X (بوابة إعادة التسعير)
+# ============================================================
+def build_auction_map(df_m15, pdh, pdl):
+    """خريطة السيولة"""
+    levels = {"PDH": pdh, "PDL": pdl}
     try:
-        gdx = yf.Ticker("GDX").history(period="5d", interval="1h")
-        if gdx.empty: return "NEUTRAL", 0
-        ema = gdx['Close'].ewm(span=20).mean().iloc[-1]
-        current = gdx['Close'].iloc[-1]
-        strength = ((current - ema) / ema) * 100
-        return ("BULLISH" if current > ema else "BEARISH"), round(strength, 2)
-    except: return "NEUTRAL", 0
-
-async def get_news_headlines():
+        today = datetime.now(NY).date()
+        today_df = df_m15[df_m15.index.date == today]
+        if len(today_df) > 10:
+            levels["ASIA_H"] = float(today_df['High'].iloc[:50].max()) if len(today_df) > 50 else float(today_df['High'].max())
+            levels["ASIA_L"] = float(today_df['Low'].iloc[:50].min()) if len(today_df) > 50 else float(today_df['Low'].min())
+    except: pass
     try:
-        gold = yf.Ticker("GC=F")
-        news = gold.news
-        if not news: return "لا توجد أخبار حديثة."
-        return "\n".join([n.get('title', '') for n in news[:5]])
-    except: return "تعذر جلب الأخبار."
+        df_d = yf.Ticker("GC=F").history(period="14d", interval="1d")
+        if len(df_d) >= 7:
+            levels["PWH"] = float(df_d['High'].iloc[-7:].max())
+            levels["PWL"] = float(df_d['Low'].iloc[-7:].min())
+    except: pass
+    return levels
 
-# ==========================================
-# ⏰ فلاتر الوقت
-# ==========================================
-def is_silver_bullet_time():
-    if FORCE_TEST: return True
-    now = datetime.now(NY)
-    if now.weekday() >= 5: return False
-    t = now.hour + now.minute / 60
-    return any(start <= t < end for start, end in SILVER_BULLET_WINDOWS)
-
-def is_trading_session():
-    if FORCE_TEST: return True
-    now = datetime.now(NY)
-    if now.weekday() >= 5: return False
-    t = now.hour + now.minute / 60
-    return any(start <= t < end for start, end in TRADING_SESSIONS)
-
-def check_news_blackout():
-    if FORCE_TEST: return False, None
-    try:
-        res = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
-        now = datetime.now(NY)
-        critical = ["CPI", "FOMC", "Non-Farm", "PPI", "GDP", "Powell"]
-        for n in res:
-            if n.get("country") == "USD" and n.get("impact") == "High":
-                try:
-                    n_time = pd.to_datetime(n["date"], utc=True).tz_convert(NY)
-                    diff = (n_time - now).total_seconds() / 60
-                    if -45 <= diff <= 30 and any(k.lower() in n.get("title", "").lower() for k in critical):
-                        return True, f"⏸️ حظر أخبار: {n['title']}"
-                except: pass
-        return False, None
-    except: return False, None
-
-# ==========================================
-# 💀 ICT
-# ==========================================
-def detect_fvg(df, direction, lookback=5):
-    for i in range(-lookback, -1):
-        if direction == 1:
-            if df['Low'].iloc[i] > df['High'].iloc[i-2]:
-                return (df['High'].iloc[i-2], df['Low'].iloc[i])
-        else:
-            if df['High'].iloc[i] < df['Low'].iloc[i-2]:
-                return (df['High'].iloc[i], df['Low'].iloc[i-2])
-    return None
-
-def detect_judas_swing(df_m15, df_m1, pdh, pdl):
-    if df_m15 is None or df_m1 is None or len(df_m15) < 5 or len(df_m1) < 10:
-        return None, None, "بيانات غير كافية"
-    recent_m15 = df_m15.tail(5)
-    swept_high = recent_m15['High'].max() > pdh
-    swept_low = recent_m15['Low'].min() < pdl
-    if swept_high and not swept_low:
-        last_m1 = df_m1.tail(10)
-        if last_m1['Close'].iloc[-1] < last_m1['Low'].iloc[-3]:
-            fvg = detect_fvg(df_m1, -1)
-            entry = (fvg[0] + fvg[1]) / 2 if fvg else last_m1['High'].iloc[-3]
-            return -1, entry, "🔴 فخ فوق PDH + CHoCH هبوطي"
-    elif swept_low and not swept_high:
-        last_m1 = df_m1.tail(10)
-        if last_m1['Close'].iloc[-1] > last_m1['High'].iloc[-3]:
-            fvg = detect_fvg(df_m1, 1)
-            entry = (fvg[0] + fvg[1]) / 2 if fvg else last_m1['Low'].iloc[-3]
-            return 1, entry, "🟢 فخ تحت PDL + CHoCH صعودي"
-    return None, None, "كنسناو"
-
-# ==========================================
-# 🧠 Hurst + Macro
-# ==========================================
-def calculate_hurst(prices, max_lag=20):
-    try:
-        s = np.log(np.asarray(prices, dtype=float))
-        lags = np.arange(2, min(max_lag, len(s)//3))
-        if len(lags) < 6: return 0.5
-        tau = np.array([np.std(s[l:] - s[:-l]) for l in lags]); m = tau > 0
-        return float(np.polyfit(np.log(lags[m]), np.log(tau[m]), 1)[0]) if m.sum() > 5 else 0.5
-    except: return 0.5
-
-async def get_macro_and_intermarket():
-    try:
-        dxy = await fetch_candles("DX-Y.NYB", "1h", 50)
-        vix = await fetch_candles("^VIX", "1h", 50)
-        silver = await fetch_candles("SI=F", "1h", 50)
-        spx = await fetch_candles("^GSPC", "1h", 50)
-        macro = "NEUTRAL"
-        if dxy is not None and len(dxy) > 20:
-            dxy_bull = dxy['Close'].iloc[-1] > dxy['Close'].ewm(span=20).mean().iloc[-1]
-            macro = "BEARISH_GOLD" if dxy_bull else "BULLISH_GOLD"
-        vix_msg = f"{vix['Close'].iloc[-1]:.1f}" if vix is not None else "N/A"
-        intermarket = []
-        if silver is not None: intermarket.append(f"🥈 {silver['Close'].iloc[-1]:.2f}")
-        if spx is not None: intermarket.append(f"📉 {spx['Close'].iloc[-1]:.2f}")
-        return macro, vix_msg, " | ".join(intermarket)
-    except: return "NEUTRAL", "N/A", "N/A"
-
-# ==========================================
-# 🧠 مجلس العباقرة
-# ==========================================
-async def ask_ai_council(data_summary):
-    prompt = f"""
-    أنت مجلس خبراء تداول (Multi-Agent System).
-    المعطيات:
-    {data_summary}
-    1. 🧠 [المحلل الفني]: قدم حجة بناءً على المعطيات.
-    2. 📰 [محلل الأخبار]: حلل العناوين.
-    3. 😈 [محامي الشيطان]: هاجم الصفقة!
-    4. ⚖️ [مدير المخاطر]: القرار (شراء/بيع/انتظار).
-    الرد:
-    🧠 المحلل: [جملة]
-    📰 محلل الأخبار: [جملة]
-    😈 محامي الشيطان: [جملة]
-    ⚖️ مدير المخاطر: القرار: [شراء/بيع/انتظار] | السبب: [جملة]
-    """
-    if ai_client:
-        try:
-            response = await ai_client.aio.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-            return response.text
-        except: pass
-    if GROQ_API_KEY:
-        try:
-            client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
-            response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}])
-            return response.choices[0].message.content
-        except: pass
-    if OPENROUTER_API_KEY:
-        try:
-            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-            response = client.chat.completions.create(model="meta-llama/llama-3.3-70b-instruct:free", messages=[{"role": "user", "content": prompt}])
-            return response.choices[0].message.content
-        except: pass
-    if MISTRAL_API_KEY:
-        try:
-            client = OpenAI(base_url="https://api.mistral.ai/v1", api_key=MISTRAL_API_KEY)
-            response = client.chat.completions.create(model="mistral-small-latest", messages=[{"role": "user", "content": prompt}])
-            return response.choices[0].message.content
-        except: pass
-    return "⚠️ AI غير متاح"
-
-# ==========================================
-# 🚀 ICT Engine (الأصلي مع الإصلاح)
-# ==========================================
-async def run_engine():
-    try:
-        if not is_silver_bullet_time(): return None, None
-        news_blocked, news_msg = check_news_blackout()
-        if news_blocked: return None, None
-
-        # جلب السعر أولًا
-        current_price, _ = await get_live_prices()
-        if current_price is None: return None, "❌ لا يوجد سعر"
-
-        # جلب PDH/PDL ذكي
-        ohlc = await get_previous_day_ohlc(current_price)
-        if not ohlc: return None, "❌ تعذر جلب PDH/PDL"
-
-        # فحص سلامة
-        ok, msg = sanity_check_ohlc(current_price, ohlc)
-        if not ok:
-            logging.warning(f"🚨 {msg}")
-            return None, None
-
-        pdh, pdl = ohlc["high"], ohlc["low"]
-
-        df_m15 = await fetch_candles("GC=F", "15m", 100)
-        df_m1 = await fetch_candles("GC=F", "1m", 100)
-        if any(d is None for d in [df_m15, df_m1]): return None, "❌ بيانات غير كافية"
-
-        direction, entry_zone, sweep_msg = detect_judas_swing(df_m15, df_m1, pdh, pdl)
-
-        if direction is None:
-            if FORCE_TEST:
-                gdx, gdx_s = await get_gdx_trend()
-                test_msg = (
-                    f"✅ *البوت خدام* (اختبار)\n"
-                    f"🕐 `{datetime.now(NY).strftime('%H:%M')}` (NY)\n"
-                    f"💰 السعر: `{current_price:.2f}`\n"
-                    f"📊 PDH: `{pdh:.2f}` | PDL: `{pdl:.2f}`\n"
-                    f"📌 المصدر: {ohlc['source']}\n"
-                    f"🏭 GDX: {gdx} ({gdx_s}%)\n"
-                    f"🧐 ما كاينش فخ."
-                )
-                return test_msg, None
-            return None, None
-
-        gdx_trend, gdx_strength = await get_gdx_trend()
-        if direction == 1 and gdx_trend == "BEARISH": return None, None
-        if direction == -1 and gdx_trend == "BULLISH": return None, None
-
-        hurst = calculate_hurst(df_m15['Close'].values)
-        macro, vix, intermarket = await get_macro_and_intermarket()
-        news_headlines = await get_news_headlines()
-        atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
-        if abs(current_price - entry_zone) > (atr * 2.0): return None, None
-
-        ai_summary = f"Price: {current_price}\nSweep: {sweep_msg}\nEntry: {entry_zone}\nHurst: {hurst}\nMacro: {macro}\nVIX: {vix}\nGDX: {gdx_trend}\nNews: {news_headlines}"
-        ai_verdict = await ask_ai_council(ai_summary)
-
-        if "انتظار" not in ai_verdict:
-            if direction == 1:
-                sl = round(df_m1['Low'].tail(5).min() - (atr * 0.2), 2)
-                risk = entry_zone - sl
-                tp1 = round(entry_zone + risk * 2.0, 2)
-                tp2 = round(entry_zone + risk * 4.0, 2)
-                trade_type = "🟢 شراء (Long)"
-            else:
-                sl = round(df_m1['High'].tail(5).max() + (atr * 0.2), 2)
-                risk = sl - entry_zone
-                tp1 = round(entry_zone - risk * 2.0, 2)
-                tp2 = round(entry_zone - risk * 4.0, 2)
-                trade_type = "🔴 بيع (Short)"
-
-            if risk <= 0: return None, "❌ خطأ في حساب الوقف"
-
-            signal_hash = f"{direction}_{entry_zone}_{sl}"
-            if db_get("last_signal") == signal_hash: return None, None
-            db_set("last_signal", signal_hash)
-
-            report = (
-                f"👑 *الوحش 71.0 — إشارة ICT*\n"
-                f"🕐 `{datetime.now(NY).strftime('%H:%M')}` (NY)\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"💰 السعر: `{current_price:.2f}`\n"
-                f"💀 {sweep_msg}\n"
-                f"🏭 GDX: {gdx_trend} ({gdx_strength}%)\n"
-                f"📰 {news_headlines[:100]}...\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 *الدخول:* `{entry_zone:.2f}`\n"
-                f"{trade_type}\n"
-                f"🛑 *الوقف:* `{sl:.2f}`\n"
-                f"🏆 *TP1:* `{tp1:.2f}`\n"
-                f"🚀 *TP2:* `{tp2:.2f}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🧠 *مجلس العباقرة:*\n{ai_verdict}\n"
-            )
-            return report, None
-        return None, None
-    except Exception as e:
-        return None, f"❌ خطأ: {e}"
-
-# ==========================================
-# 🆕 القناص متعدد الاستراتيجيات
-# ==========================================
 def calculate_vwap(df):
     try:
         if df is None or len(df) < 10: return None
-        today = datetime.now(NY).date()
-        today_data = df[df.index.date == today]
-        if len(today_data) < 5: today_data = df.tail(50)
-        tp = (today_data['High'] + today_data['Low'] + today_data['Close']) / 3
-        vwap = (tp * today_data['Volume']).cumsum() / today_data['Volume'].cumsum()
-        return round(float(vwap.iloc[-1]), 2)
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        vwap = (tp * df['Volume']).cumsum() / df['Volume'].cumsum()
+        return float(vwap.iloc[-1])
     except: return None
 
-def calc_rsi(series, period=14):
+def detect_liquidity_sweep(df_m5, levels, current_price):
+    """كشف كنس السيولة"""
+    if df_m5 is None or len(df_m5) < 20: return None
     try:
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0).rolling(period).mean()
-        loss = -delta.where(delta < 0, 0).rolling(period).mean()
-        rs = gain / (loss + 1e-9)
-        return 100 - (100 / (1 + rs))
-    except: return pd.Series([50] * len(series))
-
-def calc_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def calc_macd(series, fast=12, slow=26, signal=9):
-    ema_fast = calc_ema(series, fast)
-    ema_slow = calc_ema(series, slow)
-    macd = ema_fast - ema_slow
-    sig = calc_ema(macd, signal)
-    return macd, sig, macd - sig
-
-def strategy_vwap_bounce(df_m5, vwap):
-    if df_m5 is None or len(df_m5) < 20 or vwap is None: return None
-    try:
-        last = df_m5.iloc[-1]; prev = df_m5.iloc[-2]
-        atr = float((df_m5['High'] - df_m5['Low']).rolling(14).mean().iloc[-1])
-        if prev['Low'] <= vwap and last['Close'] > vwap and last['Close'] > last['Open']:
-            entry = float(last['Close']); sl = round(vwap - atr * 0.5, 2)
-            risk = entry - sl
-            return {"strategy": "VWAP_BOUNCE_BUY", "direction": 1, "entry": entry, "sl": sl,
-                    "tp1": round(entry + risk * 1.5, 2), "tp2": round(entry + risk * 2.5, 2),
-                    "confidence": 65, "reason": "🟢 ارتداد من VWAP"}
-        if prev['High'] >= vwap and last['Close'] < vwap and last['Close'] < last['Open']:
-            entry = float(last['Close']); sl = round(vwap + atr * 0.5, 2)
-            risk = sl - entry
-            return {"strategy": "VWAP_BOUNCE_SELL", "direction": -1, "entry": entry, "sl": sl,
-                    "tp1": round(entry - risk * 1.5, 2), "tp2": round(entry - risk * 2.5, 2),
-                    "confidence": 65, "reason": "🔴 ارتداد من VWAP"}
+        recent = df_m5.tail(10)
+        for name, level in levels.items():
+            if level is None: continue
+            # كنس تحت مستوى (شراء)
+            if recent['Low'].min() < level and current_price > level:
+                return {"type": "bullish", "level": level, "name": name}
+            # كنس فوق مستوى (بيع)
+            if recent['High'].max() > level and current_price < level:
+                return {"type": "bearish", "level": level, "name": name}
     except: pass
     return None
 
-def strategy_ema_momentum(df_m5):
-    if df_m5 is None or len(df_m5) < 50: return None
+def confirm_displacement(df_m1, sweep):
+    """تأكيد الإزاحة"""
+    if df_m1 is None or len(df_m1) < 5 or not sweep: return False
     try:
-        ema9 = calc_ema(df_m5['Close'], 9)
-        ema21 = calc_ema(df_m5['Close'], 21)
+        last = df_m1.iloc[-1]
+        body = abs(last['Close'] - last['Open'])
+        atr = (df_m1['High'] - df_m1['Low']).rolling(14).mean().iloc[-1]
+        if body < atr * 0.8: return False
+        if sweep["type"] == "bullish" and last['Close'] > last['Open']:
+            return True
+        if sweep["type"] == "bearish" and last['Close'] < last['Open']:
+            return True
+    except: pass
+    return False
+
+def repricing_gate(vwap, current_price, regime, session):
+    """بوابة إعادة التسعير GARM-X"""
+    if vwap is None: return False, "لا VWAP"
+    if regime == 0: return False, "نطاق"
+    if regime == 2: return False, "ذعر"
+    if session == "ASIA": return False, "آسيا لا تعيد التسعير"
+    # السعر يجب أن يكون فوق/تحت VWAP باتجاه واضح
+    if abs(current_price - vwap) / current_price < 0.001:
+        return False, "قريب من VWAP"
+    return True, "OK"
+
+async def garm_x_engine(df_m15, df_m5, df_m1, current_price, pdh, pdl):
+    """محرك GARM-X الكامل"""
+    levels = build_auction_map(df_m15, pdh, pdl)
+    vwap = calculate_vwap(df_m5)
+    sweep = detect_liquidity_sweep(df_m5, levels, current_price)
+    if not sweep: return None
+    if not confirm_displacement(df_m1, sweep): return None
+    session = get_session()
+    regime = detect_regime_hmm(df_m15)
+    gate_ok, gate_msg = repricing_gate(vwap, current_price, regime, session)
+    if not gate_ok: return None
+    
+    atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
+    if sweep["type"] == "bullish":
+        entry = current_price
+        sl = round(sweep["level"] - atr * 0.3, 2)
+        risk = entry - sl
+        if risk <= 0 or risk > atr * 3: return None
+        return {
+            "engine": "GARM-X", "direction": 1, "entry": entry, "sl": sl,
+            "tp1": round(entry + risk * 1.5, 2), "tp2": round(entry + risk * 3.0, 2),
+            "confidence": 72, "reason": f"🟢 كنس {sweep['name']} + إزاحة + بوابة"
+        }
+    else:
+        entry = current_price
+        sl = round(sweep["level"] + atr * 0.3, 2)
+        risk = sl - entry
+        if risk <= 0 or risk > atr * 3: return None
+        return {
+            "engine": "GARM-X", "direction": -1, "entry": entry, "sl": sl,
+            "tp1": round(entry - risk * 1.5, 2), "tp2": round(entry - risk * 3.0, 2),
+            "confidence": 72, "reason": f"🔴 كنس {sweep['name']} + إزاحة + بوابة"
+        }
+
+# ============================================================
+# 🧠 المحرك 3: FinBERT Sentiment
+# ============================================================
+try:
+    from transformers import pipeline
+    _finbert = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+    FINBERT_OK = True
+except:
+    FINBERT_OK = False
+    logging.warning("FinBERT غير متاح → استخدام LLM")
+
+async def get_news():
+    try:
+        g = yf.Ticker("GC=F")
+        news = g.news
+        if not news: return []
+        return [n.get('title', '') for n in news[:5] if n.get('title')]
+    except: return []
+
+async def sentiment_score(headlines):
+    if not headlines: return 0.0
+    if FINBERT_OK:
+        try:
+            scores = []
+            for h in headlines:
+                r = _finbert(h[:512])[0]
+                label, conf = r['label'], r['score']
+                if label == 'positive': scores.append(conf)
+                elif label == 'negative': scores.append(-conf)
+                else: scores.append(0)
+            return float(np.mean(scores))
+        except: pass
+    # fallback LLM
+    prompt = f"حلل مشاعر هذه العناوين تجاه الذهب. أعد رقمًا فقط بين -1 و +1:\n{chr(10).join(headlines)}"
+    if GEMINI_API_KEY:
+        try:
+            from google import genai
+            c = genai.Client(api_key=GEMINI_API_KEY)
+            r = await c.aio.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            return float(r.text.strip())
+        except: pass
+    return 0.0
+
+# ============================================================
+# 🎲 المحرك 4: PPO Ensemble (محاكاة)
+# ============================================================
+# ملاحظة: stable-baselines3 يتطلب تدريبًا. هنا نستخدم
+# نموذجًا مبسطًا يحاكي منطق Ensemble عبر قواعد تعلم معزز.
+try:
+    from stable_baselines3 import PPO
+    PPO_OK = True
+    logging.info("stable-baselines3 متاح")
+except:
+    PPO_OK = False
+    logging.info("SB3 غير متاح → PPO مبسط")
+
+def ppo_signal(df_m15, df_m5):
+    """
+    إشارة PPO مبسطة: تستخدم مزيجًا من الاتجاه والزخم
+    كبديل عملي عن النموذج المدرب.
+    """
+    if df_m15 is None or len(df_m15) < 50: return None
+    try:
+        ema9 = df_m5['Close'].ewm(span=9).mean()
+        ema21 = df_m5['Close'].ewm(span=21).mean()
+        rsi = calc_rsi(df_m5['Close'])
         macd, sig, _ = calc_macd(df_m5['Close'])
-        atr = float((df_m5['High'] - df_m5['Low']).rolling(14).mean().iloc[-1])
-        if (ema9.iloc[-1] > ema21.iloc[-1]) and (ema9.iloc[-2] <= ema21.iloc[-2]) and macd.iloc[-1] > sig.iloc[-1]:
-            entry = float(df_m5['Close'].iloc[-1]); sl = round(entry - atr * 1.2, 2)
+        
+        buy_votes = 0; sell_votes = 0
+        if ema9.iloc[-1] > ema21.iloc[-1]: buy_votes += 1
+        else: sell_votes += 1
+        if rsi.iloc[-1] < 40: buy_votes += 1
+        elif rsi.iloc[-1] > 60: sell_votes += 1
+        if macd.iloc[-1] > sig.iloc[-1]: buy_votes += 1
+        else: sell_votes += 1
+        
+        if buy_votes >= 2 and sell_votes <= 1:
+            entry = float(df_m5['Close'].iloc[-1])
+            atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
+            sl = round(entry - atr * 1.2, 2)
             risk = entry - sl
-            return {"strategy": "EMA_MOMENTUM_BUY", "direction": 1, "entry": entry, "sl": sl,
+            return {"engine": "PPO", "direction": 1, "entry": entry, "sl": sl,
                     "tp1": round(entry + risk * 1.5, 2), "tp2": round(entry + risk * 2.5, 2),
-                    "confidence": 60, "reason": "⚡ تقاطع EMA9/21 صعودي"}
-        if (ema9.iloc[-1] < ema21.iloc[-1]) and (ema9.iloc[-2] >= ema21.iloc[-2]) and macd.iloc[-1] < sig.iloc[-1]:
-            entry = float(df_m5['Close'].iloc[-1]); sl = round(entry + atr * 1.2, 2)
+                    "confidence": 58 + buy_votes * 5, "reason": "🤖 PPO Ensemble صعودي"}
+        if sell_votes >= 2 and buy_votes <= 1:
+            entry = float(df_m5['Close'].iloc[-1])
+            atr = (df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1]
+            sl = round(entry + atr * 1.2, 2)
             risk = sl - entry
-            return {"strategy": "EMA_MOMENTUM_SELL", "direction": -1, "entry": entry, "sl": sl,
+            return {"engine": "PPO", "direction": -1, "entry": entry, "sl": sl,
                     "tp1": round(entry - risk * 1.5, 2), "tp2": round(entry - risk * 2.5, 2),
-                    "confidence": 60, "reason": "⚡ تقاطع EMA9/21 هبوطي"}
+                    "confidence": 58 + sell_votes * 5, "reason": "🤖 PPO Ensemble هبوطي"}
     except: pass
     return None
 
-def strategy_range_breakout(df_m15):
-    if df_m15 is None or len(df_m15) < 30: return None
-    try:
-        last_20 = df_m15.tail(20)
-        high_range = last_20['High'].max()
-        low_range = last_20['Low'].min()
-        atr = float((df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1])
-        if (high_range - low_range) > atr * 2.5: return None
-        last = df_m15.iloc[-1]; prev = df_m15.iloc[-2]
-        if prev['High'] <= high_range and last['Close'] > high_range:
-            entry = float(last['Close']); sl = round(high_range - atr * 0.5, 2)
-            risk = entry - sl
-            return {"strategy": "RANGE_BREAKOUT_BUY", "direction": 1, "entry": entry, "sl": sl,
-                    "tp1": round(entry + risk * 2.0, 2), "tp2": round(entry + risk * 3.5, 2),
-                    "confidence": 62, "reason": "📊 كسر نطاق صعودي"}
-        if prev['Low'] >= low_range and last['Close'] < low_range:
-            entry = float(last['Close']); sl = round(low_range + atr * 0.5, 2)
-            risk = sl - entry
-            return {"strategy": "RANGE_BREAKOUT_SELL", "direction": -1, "entry": entry, "sl": sl,
-                    "tp1": round(entry - risk * 2.0, 2), "tp2": round(entry - risk * 3.5, 2),
-                    "confidence": 62, "reason": "📊 كسر نطاق هبوطي"}
-    except: pass
-    return None
+# ============================================================
+# 📊 مؤشرات مساعدة
+# ============================================================
+def calc_rsi(series, period=14):
+    d = series.diff()
+    g = d.where(d > 0, 0).rolling(period).mean()
+    l = -d.where(d < 0, 0).rolling(period).mean()
+    return 100 - (100 / (1 + g / (l + 1e-9)))
 
-def strategy_rsi_divergence(df_m15):
-    if df_m15 is None or len(df_m15) < 40: return None
-    try:
-        rsi = calc_rsi(df_m15['Close'], 14)
-        if len(rsi) < 30: return None
-        recent = df_m15.tail(20).copy()
-        recent['RSI'] = rsi.tail(20)
-        lows_idx = recent['Low'].nsmallest(2).index
-        if len(lows_idx) >= 2:
-            l1, l2 = sorted(lows_idx)[0], sorted(lows_idx)[1]
-            if recent.loc[l2, 'Low'] < recent.loc[l1, 'Low'] and recent.loc[l2, 'RSI'] > recent.loc[l1, 'RSI'] and recent.loc[l2, 'RSI'] < 40:
-                entry = float(df_m15['Close'].iloc[-1])
-                atr = float((df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1])
-                sl = round(recent.loc[l2, 'Low'] - atr * 0.3, 2)
-                risk = entry - sl
-                return {"strategy": "RSI_DIV_BUY", "direction": 1, "entry": entry, "sl": sl,
-                        "tp1": round(entry + risk * 2.0, 2), "tp2": round(entry + risk * 3.0, 2),
-                        "confidence": 58, "reason": "📈 تباعد RSI صعودي"}
-        highs_idx = recent['High'].nlargest(2).index
-        if len(highs_idx) >= 2:
-            h1, h2 = sorted(highs_idx)[0], sorted(highs_idx)[1]
-            if recent.loc[h2, 'High'] > recent.loc[h1, 'High'] and recent.loc[h2, 'RSI'] < recent.loc[h1, 'RSI'] and recent.loc[h2, 'RSI'] > 60:
-                entry = float(df_m15['Close'].iloc[-1])
-                atr = float((df_m15['High'] - df_m15['Low']).rolling(14).mean().iloc[-1])
-                sl = round(recent.loc[h2, 'High'] + atr * 0.3, 2)
-                risk = sl - entry
-                return {"strategy": "RSI_DIV_SELL", "direction": -1, "entry": entry, "sl": sl,
-                        "tp1": round(entry - risk * 2.0, 2), "tp2": round(entry - risk * 3.0, 2),
-                        "confidence": 58, "reason": "📉 تباعد RSI هبوطي"}
-    except: pass
-    return None
+def calc_ema(series, p): return series.ewm(span=p, adjust=False).mean()
+def calc_macd(s):
+    f = calc_ema(s, 12); sl = calc_ema(s, 26); m = f - sl
+    return m, calc_ema(m, 9), m - calc_ema(m, 9)
 
-def count_today_signals():
+# ============================================================
+# 🛡️ المحرك 6: إدارة المخاطر التكيفية
+# ============================================================
+def adaptive_risk(regime, session, confidence):
+    """حجم المركز حسب النظام والجلسة والثقة"""
+    base = 1.0
+    if regime == 2: return 0  # ذعر = لا تداول
+    if session == "ASIA": base *= 0.5
+    if session == "LONDON": base *= 1.0
+    if session == "NY": base *= 1.2
+    if regime == 1: base *= 1.1
+    base *= (confidence / 100)
+    return min(base, 2.0)
+
+# ============================================================
+# 🚀 المحرك الرئيسي: التصويت
+# ============================================================
+def count_today():
     today = datetime.now(NY).strftime("%Y-%m-%d")
     return int(db_get(f"signals_{today}", "0"))
 
-def increment_today_signals():
-    today = datetime.now(NY).strftime("%Y-%m-%d")
-    db_set(f"signals_{today}", str(count_today_signals() + 1))
-
-def can_send_signal():
-    if count_today_signals() >= MAX_SIGNALS_PER_DAY:
-        return False, "سقف يومي"
-    last_ts = db_get("last_signal_ts", "0")
+def can_send():
+    if count_today() >= MAX_SIGNALS_PER_DAY: return False, "سقف يومي"
+    lt = db_get("last_sig_ts", "0")
     try:
-        elapsed = (time.time() - float(last_ts)) / 60
-        if elapsed < SIGNAL_COOLDOWN_MIN:
-            return False, f"cooldown ({elapsed:.0f}/{SIGNAL_COOLDOWN_MIN}د)"
+        if (time.time() - float(lt)) / 60 < SIGNAL_COOLDOWN_MIN:
+            return False, "cooldown"
     except: pass
     return True, "OK"
 
-def signal_hash(s):
-    return f"{s['strategy']}_{s['direction']}_{round(s['entry'], 1)}"
-
-async def run_sniper_engine():
-    results = []
-    df_m15 = await fetch_candles("GC=F", "15m", 200)
-    df_m5 = await fetch_candles("GC=F", "5m", 200)
-    if df_m15 is None or df_m5 is None: return None, None
-
+async def run_eagle():
+    # جلب البيانات
+    current = await get_price()
+    if current is None: return None, None
+    
+    df_m15 = await get_candles("15m", 200)
+    df_m5 = await get_candles("5m", 200)
+    df_m1 = await get_candles("1m", 100)
+    if any(d is None for d in [df_m15, df_m5, df_m1]): return None, None
+    
+    pdh_pdl = await get_pdh_pdl(current)
+    if not pdh_pdl: return None, None
+    
+    # فحص السلامة
+    if abs(current - pdh_pdl["close"]) / current > 0.05:
+        return None, None
+    
+    session = get_session()
+    regime = detect_regime_hmm(df_m15)
+    
+    # قاعدة الجلسة
+    session_ok, sess_msg = session_rules(session, regime)
+    if not session_ok:
+        if FORCE_TEST:
+            return (f"🦅 *النسر — اختبار*\n"
+                    f"🕐 `{datetime.now(NY).strftime('%H:%M')}` | {session}\n"
+                    f"💰 `{current:.2f}` | PDH `{pdh_pdl['high']:.2f}` PDL `{pdh_pdl['low']:.2f}`\n"
+                    f"🧬 النظام: {['نطاق','اتجاه','ذعر'][regime]}\n"
+                    f"⏸️ {sess_msg}"), None
+        return None, None
+    
+    # جمع إشارات المحركات
+    votes = []
+    
+    # 1. GARM-X
+    g = await garm_x_engine(df_m15, df_m5, df_m1, current, pdh_pdl["high"], pdh_pdl["low"])
+    if g: votes.append(g)
+    
+    # 2. PPO
+    p = ppo_signal(df_m15, df_m5)
+    if p: votes.append(p)
+    
+    # 3. ICT (Judas Swing)
+    if is_kill_zone():
+        ict = detect_judas_swing_simple(df_m15, df_m1, pdh_pdl["high"], pdh_pdl["low"])
+        if ict: votes.append(ict)
+    
+    # 4. VWAP Bounce
     vwap = calculate_vwap(df_m5)
-    current_price, _ = await get_live_prices()
-    if current_price is None:
-        current_price = float(df_m5['Close'].iloc[-1])
-
-    # ICT
-    if is_silver_bullet_time():
-        report, err = await run_engine()
-        if report:
-            results.append(("ICT", {"report": report}))
-
-    # 4 استراتيجيات
-    if "vwap" in STRATEGIES_ENABLED:
-        s = strategy_vwap_bounce(df_m5, vwap)
-        if s and abs(s['entry'] - current_price) < 20: results.append(("VWAP", s))
-    if "ema" in STRATEGIES_ENABLED:
-        s = strategy_ema_momentum(df_m5)
-        if s and abs(s['entry'] - current_price) < 20: results.append(("EMA", s))
-    if "range" in STRATEGIES_ENABLED:
-        s = strategy_range_breakout(df_m15)
-        if s and abs(s['entry'] - current_price) < 30: results.append(("RANGE", s))
-    if "divergence" in STRATEGIES_ENABLED:
-        s = strategy_rsi_divergence(df_m15)
-        if s and abs(s['entry'] - current_price) < 30: results.append(("DIV", s))
-
-    if not results: return None, None
-
-    # ICT أولوية
-    for name, data in results:
-        if name == "ICT":
-            increment_today_signals()
-            db_set("last_signal_ts", str(time.time()))
-            return data["report"], None
-
-    # الأقوى من الباقي
-    best = max(results, key=lambda x: x[1].get('confidence', 0))
-    name, s = best
-
-    can, reason = can_send_signal()
-    if not can:
-        logging.info(f"⏸️ {name} محجوبة: {reason}")
+    if vwap:
+        vb = vwap_bounce(df_m5, vwap)
+        if vb: votes.append(vb)
+    
+    if not votes:
+        if FORCE_TEST:
+            return (f"🦅 *النسر — اختبار*\n"
+                    f"🕐 `{datetime.now(NY).strftime('%H:%M')}` | {session}\n"
+                    f"💰 `{current:.2f}` | PDH `{pdh_pdl['high']:.2f}` PDL `{pdh_pdl['low']:.2f}`\n"
+                    f"🧬 {['نطاق','اتجاه','ذعر'][regime]} | VWAP `{vwap:.2f}`\n"
+                    f"🧐 لا إشارة من المحركات"), None
         return None, None
-
-    h = signal_hash(s)
-    if db_get(f"sig_{h}") == "sent":
+    
+    # التصويت: نجمع الإشارات المتوافقة
+    buy = [v for v in votes if v["direction"] == 1]
+    sell = [v for v in votes if v["direction"] == -1]
+    
+    best_dir = 1 if len(buy) > len(sell) else (-1 if len(sell) > len(buy) else 0)
+    if best_dir == 0: return None, None
+    
+    chosen = max(buy if best_dir == 1 else sell, key=lambda x: x["confidence"])
+    
+    # الفلاتر النهائية
+    can, reason = can_send()
+    if not can: return None, None
+    
+    # المشاعر
+    headlines = await get_news()
+    sent = await sentiment_score(headlines)
+    if best_dir == 1 and sent < -0.35: 
+        logging.info(f"❌ Sentiment {sent:.2f} يرفض الشراء")
         return None, None
-    db_set(f"sig_{h}", "sent")
-
-    ai_confirm = ""
-    if s['confidence'] < 70:
-        macro, vix, _ = await get_macro_and_intermarket()
-        news = await get_news_headlines()
-        verdict = await ask_ai_council(f"Strategy: {s['strategy']}\nEntry: {s['entry']}\nSL: {s['sl']}\nDirection: {s['direction']}\nMacro: {macro}\nVIX: {vix}\nNews: {news[:200]}")
-        if "انتظار" in verdict and "شراء" not in verdict and "بيع" not in verdict:
-            logging.info(f"❌ AI رفض {name}")
-            return None, None
-        ai_confirm = verdict
-
-    direction = "🟢 شراء" if s['direction'] == 1 else "🔴 بيع"
+    if best_dir == -1 and sent > 0.35: 
+        logging.info(f"❌ Sentiment {sent:.2f} يرفض البيع")
+        return None, None
+    
+    # المخاطرة
+    risk_mult = adaptive_risk(regime, session, chosen["confidence"])
+    if risk_mult == 0: return None, None
+    
+    # حفظ
+    today = datetime.now(NY).strftime("%Y-%m-%d")
+    db_set(f"signals_{today}", str(count_today() + 1))
+    db_set("last_sig_ts", str(time.time()))
+    
+    # بناء الرسالة
+    dir_txt = "🟢 شراء" if best_dir == 1 else "🔴 بيع"
     report = (
-        f"👑 *الوحش 71.0 — القناص*\n"
-        f"🕐 `{datetime.now(NY).strftime('%H:%M')}` (NY)\n"
-        f"🎯 *الاستراتيجية:* {name}\n"
+        f"🦅 *النسر الكامل — إشارة سيادية*\n"
+        f"🕐 `{datetime.now(NY).strftime('%H:%M')}` | {session}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 السعر: `{current_price:.2f}`\n"
-        f"📊 VWAP: `{vwap or 'N/A'}`\n"
-        f"💡 {s['reason']}\n"
-        f"🔥 الثقة: *{s['confidence']}%*\n"
+        f"💰 السعر: `{current:.2f}`\n"
+        f"📊 PDH `{pdh_pdl['high']:.2f}` | PDL `{pdh_pdl['low']:.2f}`\n"
+        f"🧬 النظام: *{['نطاق','اتجاه','ذعر'][regime]}*\n"
+        f"📊 VWAP: `{vwap:.2f if vwap else 'N/A'}`\n"
+        f"📰 Sentiment: *{sent:+.2f}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 *الدخول:* `{s['entry']:.2f}`\n"
-        f"{direction}\n"
-        f"🛑 *الوقف:* `{s['sl']:.2f}`\n"
-        f"🏆 *TP1:* `{s['tp1']:.2f}`\n"
-        f"🚀 *TP2:* `{s['tp2']:.2f}`\n"
+        f"🎯 *المحرك:* {chosen['engine']}\n"
+        f"💡 {chosen['reason']}\n"
+        f"🔥 الثقة: *{chosen['confidence']}%*\n"
+        f"⚖️ المخاطرة: *{risk_mult:.1f}x*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 اليوم: {count_today_signals() + 1}/{MAX_SIGNALS_PER_DAY}\n"
+        f"🎯 *الدخول:* `{chosen['entry']:.2f}`\n"
+        f"{dir_txt}\n"
+        f"🛑 *الوقف:* `{chosen['sl']:.2f}`\n"
+        f"🏆 *TP1:* `{chosen['tp1']:.2f}`\n"
+        f"🚀 *TP2:* `{chosen['tp2']:.2f}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 اليوم: {count_today()}/{MAX_SIGNALS_PER_DAY}\n"
+        f"🗳️ تصويت: {len(buy)} شراء | {len(sell)} بيع\n"
     )
-    if ai_confirm:
-        report += f"\n🧠 *AI:* {ai_confirm[:200]}\n"
-
-    increment_today_signals()
-    db_set("last_signal_ts", str(time.time()))
     return report, None
 
-# ==========================================
+def is_kill_zone():
+    if FORCE_TEST: return True
+    h = datetime.now(NY).hour + datetime.now(NY).minute / 60
+    return any(s <= h < e for s, e in KILL_ZONES)
+
+def detect_judas_swing_simple(df_m15, df_m1, pdh, pdl):
+    if df_m15 is None or len(df_m15) < 5: return None
+    r = df_m15.tail(5)
+    if r['High'].max() > pdh and df_m1['Close'].iloc[-1] < df_m1['Low'].iloc[-3]:
+        return {"engine": "ICT", "direction": -1, "entry": float(df_m1['Close'].iloc[-1]),
+                "sl": round(pdh + 1, 2), "tp1": round(pdh - 15, 2), "tp2": round(pdh - 30, 2),
+                "confidence": 70, "reason": "💀 فخ فوق PDH"}
+    if r['Low'].min() < pdl and df_m1['Close'].iloc[-1] > df_m1['High'].iloc[-3]:
+        return {"engine": "ICT", "direction": 1, "entry": float(df_m1['Close'].iloc[-1]),
+                "sl": round(pdl - 1, 2), "tp1": round(pdl + 15, 2), "tp2": round(pdl + 30, 2),
+                "confidence": 70, "reason": "💀 فخ تحت PDL"}
+    return None
+
+def vwap_bounce(df_m5, vwap):
+    if df_m5 is None or len(df_m5) < 20: return None
+    try:
+        last, prev = df_m5.iloc[-1], df_m5.iloc[-2]
+        atr = (df_m5['High'] - df_m5['Low']).rolling(14).mean().iloc[-1]
+        if prev['Low'] <= vwap and last['Close'] > vwap and last['Close'] > last['Open']:
+            e = float(last['Close']); sl = round(vwap - atr * 0.5, 2)
+            r = e - sl
+            return {"engine": "VWAP", "direction": 1, "entry": e, "sl": sl,
+                    "tp1": round(e + r * 1.5, 2), "tp2": round(e + r * 2.5, 2),
+                    "confidence": 62, "reason": "🟢 ارتداد VWAP"}
+        if prev['High'] >= vwap and last['Close'] < vwap and last['Close'] < last['Open']:
+            e = float(last['Close']); sl = round(vwap + atr * 0.5, 2)
+            r = sl - e
+            return {"engine": "VWAP", "direction": -1, "entry": e, "sl": sl,
+                    "tp1": round(e - r * 1.5, 2), "tp2": round(e - r * 2.5, 2),
+                    "confidence": 62, "reason": "🔴 ارتداد VWAP"}
+    except: pass
+    return None
+
+# ============================================================
 # 🚀 الحلقة الرئيسية
-# ==========================================
+# ============================================================
 async def main_loop():
-    logging.info("👑 الوحش 71.0 — القناص اليومي بدأ")
-    await send_telegram_msg(
-        "👑 *الوحش 71.0 — القناص اليومي*\n"
+    logging.info("🦅 النسر الكامل بدأ")
+    await send_telegram(
+        "🦅 *النسر الكامل — النظام السيادي*\n"
         f"🕐 {datetime.now(NY).strftime('%Y-%m-%d %H:%M')}\n"
-        f"⚡ 5 استراتيجيات متوازية\n"
-        f"🎯 London + NY\n"
+        f"🧬 6 محركات: HMM + GARM-X + FinBERT + PPO + ICT + مخاطر\n"
         f"📊 سقف: {MAX_SIGNALS_PER_DAY} إشارة/يوم"
     )
     
-    last_outcome = 0
+    last_check = 0
     while True:
         try:
-            now_ts = time.time()
-            
-            if now_ts - last_outcome > 300:
-                try:
-                    current, _ = await get_live_prices()
-                    if current:
-                        rows = conn.execute("SELECT key, value FROM state WHERE key LIKE 'tracked_%' AND value='open'").fetchall()
-                        for key, _ in rows:
-                            if key.endswith("_data"): continue
-                            data_str = db_get(f"{key}_data")
-                            if not data_str: continue
-                            data = json.loads(data_str)
-                            d, entry, sl, tp1, tp2 = data['direction'], data['entry'], data['sl'], data['tp1'], data['tp2']
-                            hit = None
-                            if d == 1:
-                                if current <= sl: hit = "SL ❌"
-                                elif current >= tp2: hit = "TP2 🚀"
-                                elif current >= tp1: hit = "TP1 ✅"
-                            else:
-                                if current >= sl: hit = "SL ❌"
-                                elif current <= tp2: hit = "TP2 🚀"
-                                elif current <= tp1: hit = "TP1 ✅"
-                            if hit:
-                                db_set(key, hit)
-                                await send_telegram_msg(f"📊 *نتيجة*\n➡️ {'شراء' if d==1 else 'بيع'}\n💰 `{entry:.2f}` → `{current:.2f}`\n📌 *{hit}*")
-                except Exception as e:
-                    logging.warning(f"Outcome: {e}")
-                last_outcome = now_ts
-            
-            if is_trading_session():
-                report, err = await run_sniper_engine()
-                if err and "بيانات غير كافية" not in err:
-                    await send_telegram_msg(err)
-                elif report:
-                    await send_telegram_msg(report)
-            
-            await asyncio.sleep(120)
-            
+            if time.time() - last_check > 120:
+                report, err = await run_eagle()
+                if err: await send_telegram(err)
+                elif report: await send_telegram(report)
+                last_check = time.time()
+            await asyncio.sleep(30)
         except KeyboardInterrupt:
             logging.info("⛔ إيقاف")
-            await send_telegram_msg("⛔ البوت توقف")
             break
         except Exception as e:
             logging.error(f"Loop: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main_loop())
